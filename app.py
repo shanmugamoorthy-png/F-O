@@ -94,7 +94,10 @@ def fno_job(days):
                 have.setdefault(sy, set()).add(dd)
             c.commit()
             c.close()
-        today = datetime.now(IST).date()
+        now_ = datetime.now(IST)
+        today = now_.date()
+        small = days <= 15                                      # daily top-up: fill every missing day, today too once the market is over
+        lim = today + timedelta(days=1) if small and now_.hour * 60 + now_.minute >= 935 else today
         a0, wins = today - timedelta(days=days), []
         while a0 <= today:
             wins.append((a0, min(a0 + timedelta(days=85), today + timedelta(days=1))))
@@ -104,8 +107,8 @@ def fno_job(days):
             for a, b in wins:
                 n += 1
                 h["done"], h["msg"] = n, f"{n}/{h['total']} requests ({sy})"
-                wd = [x for x in (a + timedelta(days=k) for k in range((b - a).days)) if x.weekday() < 5 and x < today]
-                if wd and sum(x.strftime("%Y-%m-%d") in have.get(sy, ()) for x in wd) >= 0.8 * len(wd):
+                wd = [x for x in (a + timedelta(days=k) for k in range((b - a).days)) if x.weekday() < 5 and x < lim]
+                if wd and sum(x.strftime("%Y-%m-%d") in have.get(sy, ()) for x in wd) >= (0.999 if small else 0.8) * len(wd):
                     continue
                 body = {"securityId": sid, "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "interval": "5", "oi": False,
                         "fromDate": a.strftime("%Y-%m-%d"), "toDate": b.strftime("%Y-%m-%d")}
@@ -268,6 +271,207 @@ def fno_bt_job(symbol):
 
 
 
+
+# ======================= Live paper alerts =======================
+SIG_MIN = float(os.environ.get("SIG_MIN", "1.7"))      # alert only when the signal is at least this many times the entry threshold
+STRONG = 2.5
+
+
+@st.cache_resource
+def live_state():
+    return {"models": {}, "ids": {}, "fit_day": "", "scanned": -1, "closed": "", "hist": "", "note": "starting...",
+            "last_scan": "", "thread": None, "busy": ""}
+
+
+def day_bars(sid, day):
+    """Today's 5-min closes of one stock, as an array of 75 (nan where missing)."""
+    body = {"securityId": sid, "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "interval": "5", "oi": False,
+            "fromDate": day.strftime("%Y-%m-%d"), "toDate": (day + timedelta(days=1)).strftime("%Y-%m-%d")}
+    j = hist_post(body, path="/charts/intraday")
+    j = j.get("data") or j
+    ts, cl = j.get("timestamp") or [], j.get("close") or []
+    arr = np.full(75, np.nan)
+    if ts:
+        off = 315532800 if datetime.fromtimestamp(ts[0], IST).year < 2020 else 0
+        for t_, v_ in zip(ts, cl):
+            x = datetime.fromtimestamp(t_ + off, IST)
+            k = (x.hour * 60 + x.minute - 555) // 5
+            if x.date() == day and 0 <= k < 75:
+                arr[k] = v_
+    return arr
+
+
+def live_fit():
+    """Train one model per stock on all stored history (same model as the backtest)."""
+    ls = live_state()
+    ls["busy"] = "training models..."
+    ids = fno_ids()
+    with LOCK:
+        c = db()
+        have = {r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450")}
+        c.close()
+    models = {}
+    for sy, sid in ids.items():
+        if sy not in have:
+            continue
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+            c.close()
+        C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+        C = np.take_along_axis(C, np.maximum.accumulate(np.where(np.isnan(C), 0, np.arange(75)), axis=1), axis=1)
+        ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+        C, days = C[ok], [r[0] for r, o in zip(rows, ok) if o]
+        if len(C) < 450:
+            continue
+        X3, Y3, _ = fno_feats(C)
+        Xt = X3.reshape(-1, 12)
+        mu, sd = Xt.mean(0), Xt.std(0) + 1e-9
+        A = (Xt - mu) / sd
+        yv = Y3.reshape(-1)
+        w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(12), A.T @ (yv - yv.mean()))
+        models[sy] = dict(mu=mu, sd=sd, w=w, thr=float(np.percentile(np.abs(A @ w), 90)), prev=C[-1], prevday=days[-1], id=sid)
+    ls["models"], ls["ids"] = models, ids
+    ls["busy"] = ""
+    ls["note"] = f"{len(models)} stock models ready"
+
+
+def paper_db():
+    with LOCK:
+        c = db()
+        c.execute("""CREATE TABLE IF NOT EXISTS fnopaper(day TEXT, sym TEXT, t_in TEXT, side TEXT, entry REAL, ratio REAL,
+                     t_out TEXT, exit REAL, bp REAL, PRIMARY KEY(day, sym))""")
+        c.commit()
+        c.close()
+
+
+def live_scan(now):
+    """Look at every stock's finished 5-min bars; the first confident moment of the day makes one paper trade + Telegram alert."""
+    ls = live_state()
+    day = now.date()
+    d_s = day.strftime("%Y-%m-%d")
+    kmax = (now.hour * 60 + now.minute - 555) // 5 - 1          # last FINISHED bar (the forming bar is ignored)
+    if kmax < 12:
+        return 0
+    paper_db()
+    with LOCK:
+        c = db()
+        done = {r[0] for r in c.execute("SELECT sym FROM fnopaper WHERE day=?", (d_s,))}
+        c.close()
+    n = 0
+    for sy, m in ls["models"].items():
+        if sy in done:
+            continue
+        try:
+            if (day - datetime.strptime(m["prevday"], "%Y-%m-%d").date()).days > 6:
+                continue                                          # yesterday missing: skip this stock today
+            arr = day_bars(m["id"], day)
+            time.sleep(0.12)
+            row = arr[:kmax + 1]
+            if np.isnan(row[0]):
+                continue
+            row = np.where(np.isnan(row), 0, row)
+            row = np.take_along_axis(row[None], np.maximum.accumulate(np.where(row == 0, 0, np.arange(len(row))))[None], axis=1)[0]
+            row = np.concatenate([row, np.full(75 - len(row), row[-1])])
+            X = fno_feats(np.stack([m["prev"], row]))[0][1]      # today's features for bars 12..63
+            top = min(kmax, 63) - 12
+            if top < 0:
+                continue
+            ratio = np.abs(((X[:top + 1] - m["mu"]) / m["sd"]) @ m["w"]) / m["thr"]
+            hit = np.where(ratio >= SIG_MIN)[0]
+            if not len(hit):
+                continue
+            j = int(hit[0])
+            k = j + 12
+            if k < kmax - 2:
+                continue                                          # signal was long ago (service started late): do not chase
+            side = "BUY" if (((X[j] - m["mu"]) / m["sd"]) @ m["w"]) > 0 else "SELL"
+            t_in = f"{(555 + 5 * k + 5) // 60:02d}:{(555 + 5 * k + 5) % 60:02d}"
+            with LOCK:
+                c = db()
+                c.execute("INSERT OR IGNORE INTO fnopaper(day,sym,t_in,side,entry,ratio) VALUES(?,?,?,?,?,?)",
+                          (d_s, sy, t_in, side, float(row[k]), float(ratio[j])))
+                c.commit()
+                c.close()
+            send_telegram(f"PAPER {side} {sy} at {t_in}, price {row[k]:,.2f}. Signal {ratio[j]:.1f}x"
+                          f"{' (STRONG)' if ratio[j] >= STRONG else ''}. Paper trade, exit about 15:25. Research, not advice.")
+            n += 1
+        except Exception as e:
+            ls["note"] = f"scan error {sy}: {str(e)[:100]}"
+            if "401" in str(e) or "DH-906" in str(e):
+                ls["note"] = "Dhan token expired: update DHAN_ACCESS_TOKEN in Render"
+                return n
+    ls["last_scan"] = f"{now:%H:%M} bar {kmax}, {n} new"
+    return n
+
+
+def live_close(now):
+    """After the close: record each paper trade's exit (15:25 bar) and send a one-line summary."""
+    paper_db()
+    d_s = now.strftime("%Y-%m-%d")
+    ls = live_state()
+    with LOCK:
+        c = db()
+        op = c.execute("SELECT sym, side, entry FROM fnopaper WHERE day=? AND exit IS NULL", (d_s,)).fetchall()
+        c.close()
+    bps = []
+    for sy, side, entry in op:
+        try:
+            arr = day_bars(ls["ids"][sy], now.date())
+            time.sleep(0.12)
+            ok = arr[~np.isnan(arr)]
+            if not len(ok):
+                continue
+            bp = (1 if side == "BUY" else -1) * (ok[-1] / entry - 1) * 1e4
+            with LOCK:
+                c = db()
+                c.execute("UPDATE fnopaper SET t_out=?, exit=?, bp=? WHERE day=? AND sym=?", ("15:25", float(ok[-1]), float(bp), d_s, sy))
+                c.commit()
+                c.close()
+            bps.append(bp)
+        except Exception as e:
+            ls["note"] = f"close error {sy}: {str(e)[:100]}"
+    if bps:
+        send_telegram(f"PAPER RESULTS today: {len(bps)} trades, average {np.mean(bps):+.1f} bp, best {max(bps):+.0f}, worst {min(bps):+.0f}. Research, not advice.")
+
+
+def live_loop():
+    ls = live_state()
+    while True:
+        try:
+            now = datetime.now(IST).replace(tzinfo=None)
+            mnow, d_s = now.hour * 60 + now.minute, now.strftime("%Y-%m-%d")
+            if now.weekday() < 5:
+                if ls["fit_day"] != d_s and mnow >= 525 and CID and TOKEN:      # from 08:45: top up history, then train
+                    ls["fit_day"] = d_s
+                    ls["busy"] = "topping up history..."
+                    fno_job(10)
+                    live_fit()
+                if ls["models"] and 555 + 5 * 13 <= mnow < 14 * 60 + 40 and ((mnow - 555) % 5 > 0 or now.second >= 25):
+                    kmax = (mnow - 555) // 5 - 1
+                    if kmax > ls["scanned"] or ls.get("scanned_day") != d_s:
+                        ls["scanned"], ls["scanned_day"] = kmax, d_s
+                        live_scan(now)
+                if mnow >= 15 * 60 + 31 and ls["closed"] != d_s and ls["models"]:
+                    ls["closed"] = d_s
+                    live_close(now)
+                if mnow >= 15 * 60 + 45 and ls["hist"] != d_s and CID and TOKEN:
+                    ls["hist"] = d_s
+                    fno_job(5)
+        except Exception as e:
+            ls["note"] = f"loop error: {str(e)[:120]}"
+        time.sleep(20)
+
+
+def ensure_live():
+    ls = live_state()
+    if not (CID and TOKEN):
+        return
+    if ls["thread"] is None or not ls["thread"].is_alive():
+        ls["thread"] = threading.Thread(target=live_loop, daemon=True)
+        ls["thread"].start()
+
+
 # ======================= Page =======================
 st.set_page_config(page_title="F&O stock scanner (research)", layout="wide")
 st.title("F&O stock scanner (research)")
@@ -297,6 +501,33 @@ def status():
 
 
 status()
+ensure_live()
+
+
+@st.fragment(run_every=30)
+def live_panel():
+    ls = live_state()
+    st.subheader("Live paper alerts")
+    st.caption(f"Signal strength at least {SIG_MIN}x. {ls['note']} {ls['busy']} Last scan: {ls['last_scan'] or 'none yet'}. "
+               "From 08:45 it tops up data and trains; scans every 5 min from 10:19; exits at 15:25. Paper only, no money.")
+    try:
+        with LOCK:
+            c = db()
+            t = pd.read_sql("SELECT * FROM fnopaper ORDER BY day DESC, t_in DESC LIMIT 300", c)
+            c.close()
+    except Exception:
+        t = pd.DataFrame()
+    if t.empty:
+        st.caption("No paper trades yet.")
+        return
+    dn = t[t.bp.notna()]
+    if len(dn):
+        st.write(f"Closed: {len(dn)} trades on {dn.day.nunique()} days, right {(dn.bp > 0).mean() * 100:.0f}%, "
+                 f"average {dn.bp.mean():+.1f} bp, after 10 bp cost {dn.bp.mean() - 10:+.1f} bp")
+    st.dataframe(t, hide_index=True)
+
+
+live_panel()
 if st.button("Send test Telegram"):
     ok, info = send_telegram("Test from F&O scanner: Telegram works.")
     if ok:
