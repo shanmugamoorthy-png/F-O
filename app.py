@@ -160,7 +160,7 @@ def fno_feats(C):
     X += [(C[:, ks] / C[:, :1] - 1) * 1e4, (C[:, ks] - rmin[:, ks]) / (rmax[:, ks] - rmin[:, ks] + 1e-9), sw[:, ks - 11],
           np.broadcast_to(er[:, None], sh), np.broadcast_to(5 * ks / 375, sh), np.broadcast_to(pr[:, None], sh),
           np.broadcast_to(prr[:, None], sh), np.broadcast_to(gap[:, None], sh)]
-    return np.stack(X, -1), (C[:, -1:] / C[:, ks] - 1) * 1e4
+    return np.stack(X, -1), (C[:, -1:] / C[:, ks] - 1) * 1e4, (C[:, -1:] / C[:, ks + 1] - 1) * 1e4
 
 
 def fno_bt_job(symbol):
@@ -192,7 +192,7 @@ def fno_bt_job(symbol):
             yr = np.array([x[:4] for x in days])
             if len(set(yr)) < 3:
                 continue
-            X3, Y3 = fno_feats(C)
+            X3, Y3, Y1 = fno_feats(C)
             for rep in range(REP + 1):
                 Yr = Y3 if rep == 0 else Y3[rg.permutation(len(Y3))]
                 for Z in sorted(set(yr))[2:]:
@@ -209,10 +209,12 @@ def fno_bt_job(symbol):
                     f = m.argmax(1)
                     r_ = np.arange(len(f))
                     sgn, y_ = np.sign(pred[r_, f]), Yr[te][r_, f]
-                    for dd, hv, s_, yy in zip(days[te][has], has[has], sgn[has], y_[has]):
-                        res[rep].append((dd, s_ * yy, s_, yy, sy))
+                    rat = np.abs(pred[r_, f]) / thr
+                    yd = Y1[te][r_, f] if rep == 0 else y_
+                    for dd, s_, yy, rr, y1 in zip(days[te][has], sgn[has], y_[has], rat[has], yd[has]):
+                        res[rep].append((dd, s_ * yy, s_, yy, sy, rr, s_ * y1))
         def stat(L):
-            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym"])
+            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym", "rat", "pnl1"])
             g = a.groupby("day").pnl.mean()
             return a, g.mean(), g.mean() / (g.std() / np.sqrt(len(g)) + 1e-9)
         a, m0, t0 = stat(res[0])
@@ -230,6 +232,12 @@ def fno_bt_job(symbol):
                f"  after an ASSUMED 10 bp round-trip cost (stock option spread + charges, unverified): {a.pnl.mean() - 10:+.2f} bp",
                f"  stocks with positive average: {int((ps['mean'] > 0).sum())} of {len(ps)};  stocks with t above 2: {int((ps.t > 2).sum())} (pure chance gives about {0.023 * len(ps):.0f})",
                "  best 5 by t-stat (picked after the fact, so flattering): " + ", ".join(f"{k} {v.t:+.1f}" for k, v in ps.sort_values("t", ascending=False).head(5).iterrows()),
+               f"  BUY trades: stock itself moved {a[a.side > 0].raw.mean():+.2f} bp;  SELL trades: stock moved {a[a.side < 0].raw.mean():+.2f} bp (the model gains {-a[a.side < 0].raw.mean():+.2f} bp by selling)",
+               "  by confidence (signal strength vs the entry threshold): " + "  ".join(
+                   f"{lo}-{hi}x: {a[(a.rat >= lo) & (a.rat < hi)].pnl.mean():+.1f} bp (n={int(((a.rat >= lo) & (a.rat < hi)).sum())})"
+                   for lo, hi in ((1, 1.3), (1.3, 1.7), (1.7, 2.5), (2.5, 99))),
+               f"  if you could only ENTER ONE BAR (5 min) LATER on the same signals: {a.pnl1.mean():+.2f} bp",
+               "  net average per trade after a round-trip cost of:  " + "   ".join(f"{k} bp: {a.pnl.mean() - k:+.1f}" for k in (3, 5, 8, 10)),
                "",
                "  Real only if the per-day average clearly beats the scrambled runs, is positive in every year,",
                "  t-stat is above 3, and it stays positive after realistic costs. Not advice."]
