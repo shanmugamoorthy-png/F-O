@@ -279,7 +279,10 @@ def status():
 status()
 if st.button("Send test Telegram"):
     ok, info = send_telegram("Test from F&O scanner: Telegram works.")
-    st.success("Test sent") if ok else st.error(f"Failed: {info}")
+    if ok:
+        st.success("Test sent")
+    else:
+        st.error(f"Failed: {info}")
 st.caption("If the box does not update, reload the page. The work continues on the server.")
 
 # === END OF app.py (if you do not see this line at the bottom, the paste was cut off) ===
