@@ -211,13 +211,14 @@ def fno_bt_job(symbol):
                     sgn, y_ = np.sign(pred[r_, f]), Yr[te][r_, f]
                     rat = np.abs(pred[r_, f]) / thr
                     yd = Y1[te][r_, f] if rep == 0 else y_
-                    for dd, s_, yy, rr, y1 in zip(days[te][has], sgn[has], y_[has], rat[has], yd[has]):
-                        res[rep].append((dd, s_ * yy, s_, yy, sy, rr, s_ * y1))
+                    for dd, s_, yy, rr, y1, k_ in zip(days[te][has], sgn[has], y_[has], rat[has], yd[has], f[has] + 12):
+                        res[rep].append((dd, s_ * yy, s_, yy, sy, rr, s_ * y1, k_))
         def stat(L):
-            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym", "rat", "pnl1"])
+            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym", "rat", "pnl1", "k"])
             g = a.groupby("day").pnl.mean()
             return a, g.mean(), g.mean() / (g.std() / np.sqrt(len(g)) + 1e-9)
         a, m0, t0 = stat(res[0])
+        nf = [stat(res[k])[0] for k in range(1, REP + 1)]
         nulls = [stat(res[k])[1] for k in range(1, REP + 1)]
         a["yr"] = a.day.str[:4]
         ps = a.groupby("sym").pnl.agg(["mean", "count", "std"])
@@ -241,6 +242,25 @@ def fno_bt_job(symbol):
                "",
                "  Real only if the per-day average clearly beats the scrambled runs, is positive in every year,",
                "  t-stat is above 3, and it stays positive after realistic costs. Not advice."]
+        for lo in (1.7, 2.5):
+            b = a[a.rat >= lo]
+            if len(b) < 50:
+                continue
+            g = b.groupby("day").pnl.mean()
+            tp = b.groupby("sym").size().sort_values(ascending=False)
+            dsum = b.groupby("day").pnl.sum().sort_values(ascending=False)
+            keep = g.sort_values().iloc[:int(len(g) * 0.95)]
+            nl = [x[x.rat >= lo].pnl.mean() for x in nf]
+            out += ["", f"HIGH-CONFIDENCE ONLY (signal at least {lo}x the entry threshold):",
+                    f"  {len(b):,} trades on {len(g)} days = about {len(b) / len(g):.1f} signals per day across all stocks",
+                    f"  average per trade {b.pnl.mean():+.1f} bp, right {(b.pnl > 0).mean() * 100:.0f}%, median trade {b.pnl.median():+.1f} bp",
+                    f"  per DAY average {g.mean():+.1f} bp, t-stat {g.mean() / (g.std() / np.sqrt(len(g)) + 1e-9):+.1f};  scrambled outcomes (luck): {np.nanmean(nl):+.1f} bp, highest {np.nanmax(nl):+.1f}",
+                    "  by year: " + "  ".join(f"{y}: {b[b.yr == y].pnl.mean():+.1f} bp (n={int((b.yr == y).sum())})" for y in sorted(set(b.yr))),
+                    f"  entered one bar (5 min) later: {b.pnl1.mean():+.1f} bp;  BUY trades {b[b.side > 0].pnl.mean():+.1f} bp, SELL trades {b[b.side < 0].pnl.mean():+.1f} bp",
+                    "  net per trade after round-trip cost:  " + "   ".join(f"{k} bp: {b.pnl.mean() - k:+.1f}" for k in (5, 8, 10, 15)),
+                    f"  concentration: top 10 stocks make {tp.head(10).sum() / len(b) * 100:.0f}% of the trades;  best 5 days make {dsum.head(5).sum() / dsum.sum() * 100:.0f}% of total profit;  average of the worse 95% of days: {keep.mean():+.1f} bp",
+                    "  by entry time: " + "  ".join(f"{hh}h: {b[(555 + 5 * b.k) // 60 == hh].pnl.mean():+.1f} bp (n={int(((555 + 5 * b.k) // 60 == hh).sum())})" for hh in (10, 11, 12, 13, 14))]
+        out += ["", "  (Strong signals earn more, which is what a real effect looks like. Still check: circuit-limit stocks, wide spreads, F&O ban list.)"]
         h["analysis"] = "\n".join(out)
     except Exception as e:
         h["analysis"] = f"F&O backtest failed: {e}"
