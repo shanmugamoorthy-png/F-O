@@ -761,6 +761,142 @@ def fno_xs_job(K=10, minn=40):
         h["analysis"] = f"Intraday ranking test failed: {e}"
 
 
+def intraday_panel(h, label):
+    """One row per stock per day: 09:20->10:15 move, trailing volatility, relative morning volume, 10:20->close outcome, sector."""
+    sm = sector_map()
+    with LOCK:
+        c = db()
+        syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+        c.close()
+    out = []
+    for n_, sy in enumerate(syms):
+        h["analysis"] = f"Running {label}... loading stock {n_ + 1}/{len(syms)} ({sy})"
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT d.day, d.b, v.b FROM fnod d JOIN fnov v ON v.sym = d.sym AND v.day = d.day WHERE d.sym=? ORDER BY d.day", (sy,)).fetchall()
+            c.close()
+        if len(rows) < 60:
+            continue
+        days = np.array([r[0] for r in rows])
+        C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+        HV = np.array([np.frombuffer(r[2], np.float32).reshape(3, 75) for r in rows], float)
+        ix = np.where(np.isnan(C), 0, np.arange(75))
+        C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+        ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+        C, days, HV = C[ok], days[ok], HV[ok]
+        D = C[:, -1]
+        dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+        vs = pd.Series(dr).rolling(20).std().shift(1).to_numpy()
+        vm = HV[:, 2, :12]
+        mv = np.where(np.isfinite(vm).sum(1) >= 10, np.nansum(vm, 1), np.nan)            # 09:15-10:15 volume
+        usual = pd.Series(mv).rolling(20, min_periods=15).mean().shift(1).to_numpy()     # usual for that hour, known before today
+        good = np.isfinite(vs) & (vs > 1e-4) & np.isfinite(usual) & (usual > 0) & np.isfinite(mv)
+        out.append(pd.DataFrame({"day": days[good], "sym": sy, "rm": C[good, 11] / C[good, 0] - 1, "vs": vs[good],
+                                 "rv": mv[good] / usual[good], "ret": (C[good, -1] / C[good, 12] - 1) * 1e4,
+                                 "ind": sm.get(sy, "")}))
+    a = pd.concat(out, ignore_index=True)
+    a["sc"] = (a.rm - a.groupby("day").rm.transform("mean")) / a.vs
+    return a
+
+
+def _xs_report(title, rules, recs, h, extra):
+    """recs: list of (day, long outcomes array, short outcomes array, all outcomes that day). Prints the standard verdict block."""
+    L = np.array([l.mean() for _, l, s, _ in recs])
+    S = np.array([-s.mean() for _, l, s, _ in recs])
+    M = np.array([r.mean() for *_, r in recs])
+    P = (L + S) / 2
+    yy = np.array([d[:4] for d, *_ in recs])
+    yrs = [y for y in sorted(set(yy)) if (yy == y).sum() >= 20]
+    rg = np.random.default_rng(23)
+    nul = []
+    for k in range(400):
+        if k % 50 == 0:
+            h["analysis"] = f"Running {title}... luck check {k}/400"
+        x = 0.0
+        for _, l, s, r in recs:
+            p = rg.permutation(len(r))
+            x += (r[p[:len(l)]].mean() - r[p[len(l):len(l) + len(s)]].mean()) / 2
+        nul.append(x / len(recs))
+    nul = np.array(nul)
+    tt = lambda v: v.mean() / (v.std() / np.sqrt(len(v)) + 1e-9)
+    lo, hi = np.percentile(nul, 2.5), np.percentile(nul, 97.5)
+    return [title, rules,
+            f"  {len(recs)} days, years {', '.join(yrs)}. Nothing is fitted, so every year is out-of-sample.",
+            f"  average per trade (long and short together): {P.mean():+.1f} bp, daily t-stat {tt(P):+.1f}, days positive {(P > 0).mean() * 100:.0f}%",
+            f"  luck check (same number of stocks picked at random each day, 400 runs): middle 95% {lo:+.1f} to {hi:+.1f};  outside the luck range: {'YES' if (P.mean() > hi or P.mean() < lo) else 'no'}",
+            f"  long leg {L.mean():+.1f} bp vs the average stock {M.mean():+.1f} (so {L.mean() - M.mean():+.1f} over the market);  short leg {S.mean():+.1f} bp",
+            "  by year: " + "  ".join(f"{y}: {P[yy == y].mean():+.1f} bp (t {tt(P[yy == y]):+.1f}, {int((yy == y).sum())} days)" for y in yrs),
+            "  after a round-trip cost per trade of:  " + "   ".join(f"{k} bp: {P.mean() - k:+.1f}" for k in (5, 10, 15)),
+            f"  worst day {P.min():+.0f} bp, best day {P.max():+.0f} bp;  best 10 days make {np.sort(P)[::-1][:10].sum() / P.sum() * 100:.0f}% of the total"] + extra + [
+            "", "  Real only if: outside the luck range, daily t-stat above 3, positive in EVERY year, and still positive after 10 bp.",
+            "  (A clearly NEGATIVE result would mean the opposite trade works.) One fixed design, not tuned. Not advice."]
+
+
+def fno_vol_job(K=5, need=10):
+    """VOLUME-CONFIRMED MORNING MOVE: among stocks trading at least 2x their usual 09:15-10:15 volume, long the K strongest
+    and short the K weakest 09:20-10:15 movers (vs the average stock, scaled by volatility). Enter 10:20, exit at the close."""
+    h = hist_state()
+    try:
+        a = intraday_panel(h, "volume test")
+        recs, ctl, allk, nh = [], [], [], []
+        for d, g in a.groupby("day", sort=True):
+            hv = g[g.rv >= 2]
+            lw = g[g.rv < 1]
+            if len(hv) >= need:
+                o = hv.sort_values("sc")
+                recs.append((d, o.ret.to_numpy()[-K:], o.ret.to_numpy()[:K], g.ret.to_numpy()))
+                nh.append(len(hv))
+                if len(lw) >= need:
+                    q = lw.sort_values("sc").ret.to_numpy()
+                    ctl.append((q[-K:].mean() - q[:K].mean()) / 2)
+                q = g.sort_values("sc").ret.to_numpy()
+                allk.append((q[-K:].mean() - q[:K].mean()) / 2)
+        if len(recs) < 50:
+            h["analysis"] = f"Volume test: only {len(recs)} days had {need}+ high-volume stocks."
+            return
+        extra = ["",
+                 f"  comparison (same days, same K={K}): ignoring volume {np.mean(allk):+.1f} bp;  LOW-volume stocks only (under 1x usual) {np.mean(ctl):+.1f} bp",
+                 f"  high-volume stocks per day: average {np.mean(nh):.0f} (days with fewer than {need} were skipped: {a.day.nunique() - len(recs)} of {a.day.nunique()})",
+                 "  If volume matters, the high-volume line (top) should be clearly better than both comparison numbers."]
+        h["analysis"] = "\n".join(_xs_report(
+            "VOLUME-CONFIRMED MORNING MOVE (market-neutral, intraday)",
+            f"  at 10:15, among stocks with 09:15-10:15 volume at least 2x their 20-day usual: long the {K} strongest, short the {K} weakest movers; enter 10:20, exit at the close",
+            recs, h, extra))
+    except Exception as e:
+        h["analysis"] = f"Volume test failed: {e}"
+
+
+def fno_sector_job(K=3, need=5):
+    """STRONGEST STOCKS IN THE STRONGEST SECTOR: at 10:15 find the sector that moved most vs the market (and the weakest);
+    long the K strongest stocks of the strong sector, short the K weakest of the weak sector. Enter 10:20, exit at the close."""
+    h = hist_state()
+    try:
+        a = intraday_panel(h, "sector test")
+        a = a[a.ind != ""]
+        recs, whole = [], []
+        for d, g in a.groupby("day", sort=True):
+            cnt = g.groupby("ind").size()
+            ok = cnt[cnt >= need].index
+            gg = g[g.ind.isin(ok)]
+            if len(ok) < 4:
+                continue
+            sec = gg.groupby("ind").sc.mean().sort_values()
+            top, bot = gg[gg.ind == sec.index[-1]].sort_values("sc"), gg[gg.ind == sec.index[0]].sort_values("sc")
+            recs.append((d, top.ret.to_numpy()[-K:], bot.ret.to_numpy()[:K], g.ret.to_numpy()))
+            whole.append((top.ret.mean() - bot.ret.mean()) / 2)
+        if len(recs) < 50:
+            h["analysis"] = f"Sector test: only {len(recs)} usable days."
+            return
+        extra = ["", f"  comparison: the WHOLE strongest sector vs the WHOLE weakest sector (all their stocks): {np.mean(whole):+.1f} bp",
+                 f"  sectors used: those with at least {need} stocks with data that day ({a.ind.nunique()} industries in the list)"]
+        h["analysis"] = "\n".join(_xs_report(
+            "STRONGEST STOCKS IN THE STRONGEST SECTOR (market-neutral, intraday)",
+            f"  at 10:15: strongest sector vs the market -> long its {K} strongest stocks; weakest sector -> short its {K} weakest; enter 10:20, exit at the close",
+            recs, h, extra))
+    except Exception as e:
+        h["analysis"] = f"Sector test failed: {e}"
+
+
 def sector_map():
     """Stock -> industry, from NSE's Nifty 500 list saved in the repo as sectors.csv (next to app.py)."""
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sectors.csv")
@@ -1186,6 +1322,12 @@ if st.button("5) Run SWING exit test (hold vs take profit 3/4/5% vs stop-loss 3%
 if st.button("6) Run INTRADAY ranking test (market-neutral, long top 10 / short bottom 10 at 10:15)"):
     threading.Thread(target=fno_xs_job, daemon=True).start()
     _hs["analysis"] = "Running intraday ranking test... (a few minutes)"
+if st.button("7) Run VOLUME test (morning move confirmed by 2x volume)"):
+    threading.Thread(target=fno_vol_job, daemon=True).start()
+    _hs["analysis"] = "Running volume test... (a few minutes)"
+if st.button("8) Run SECTOR test (strongest stocks in the strongest sector)"):
+    threading.Thread(target=fno_sector_job, daemon=True).start()
+    _hs["analysis"] = "Running sector test... (a few minutes)"
 
 
 @st.fragment(run_every=5)
