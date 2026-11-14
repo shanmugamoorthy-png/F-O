@@ -710,10 +710,43 @@ st.title("📈 F&O price-model alerts")
 st.caption("Paper trading only, no real orders. Intraday alerts on every F&O stock plus a weekly market-neutral swing list. Research, not advice.")
 if not (CID and TOKEN):
     st.error("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Render (Environment tab), then redeploy.")
-tab1, tab2, tab3 = st.tabs(["Intraday alerts", "Weekly swing list", "Settings & data"])
+
+
+def _version():
+    """A cheap fingerprint of everything the page shows; it changes when a trade, exit, scan or weekly list changes."""
+    ls = live_state()
+    try:
+        with LOCK:
+            c = db()
+            a = c.execute("SELECT COUNT(*), COUNT(bp) FROM fnopaper").fetchone()
+            try:
+                b = c.execute("SELECT COUNT(*), COUNT(entry), COUNT(bp) FROM swingpaper").fetchone()
+            except Exception:
+                b = ()
+            c.close()
+    except Exception:
+        a, b = (), ()
+    h = hist_state()
+    return (a, b, ls["last_scan"], ls["note"], ls["busy"], ls["thread"] is not None and ls["thread"].is_alive(),
+            h["running"], h["msg"].split(" (")[0] if h["running"] else h["msg"])
 
 
 @st.fragment(run_every=60)
+def auto_refresh():
+    """The only timer on the page: once a minute, reload the page if anything new happened (selections are kept)."""
+    v = _version()
+    if st.session_state.get("_ver") is None:
+        st.session_state["_ver"] = v
+    elif st.session_state["_ver"] != v:
+        st.session_state["_ver"] = v
+        st.rerun()
+
+
+auto_refresh()
+tab1, tab2, tab3 = st.tabs(["Intraday alerts", "Weekly swing list", "Settings & data"])
+
+
+@st.fragment
 def intraday_tab():
     ls = live_state()
     alive = ls["thread"] is not None and ls["thread"].is_alive()
@@ -772,7 +805,7 @@ def intraday_tab():
         st.download_button("Download all intraday paper trades (CSV)", t.to_csv(index=False), "intraday_paper.csv", "text/csv")
 
 
-@st.fragment(run_every=120)
+@st.fragment
 def swing_tab():
     st.caption("Every Friday after 15:50 the market-neutral model ranks all F&O stocks: long the top 10, short the bottom 10. "
                "Entry next trading morning 09:20, exit the following Friday close. Telegram sends the list and the result.")
@@ -861,7 +894,6 @@ def data_check():
     return a, b
 
 
-@st.fragment(run_every=5)
 def download_status():
     if _hs["running"] or _hs["msg"]:
         st.caption(f"{'Running' if _hs['running'] else 'Idle'} - {_hs['msg'] or 'not started'} - {_hs['rows']:,} stock-days saved")
