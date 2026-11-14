@@ -619,6 +619,10 @@ def range_5m(sid, from_s, to_s):
                     rows.append((x, j["open"][i], j["high"][i], j["low"][i], j["close"][i], vol[i]))
         a = b + timedelta(days=1)
     df = pd.DataFrame(rows, columns=["dt", "o", "h", "l", "c", "v"])
+    for k in ("o", "h", "l", "c", "v"):
+        df[k] = pd.to_numeric(df[k], errors="coerce")
+    df["v"] = df.v.fillna(0)
+    df = df.dropna(subset=["o", "h", "l", "c"])
     return df.drop_duplicates("dt").sort_values("dt").reset_index(drop=True)
 
 
@@ -667,13 +671,26 @@ def candles(out, marks, hline=None):
 def show_candles(out, marks, hline=None):
     pch, vch = candles(out, marks, hline)
     st.altair_chart(pch, use_container_width=True)
-    st.altair_chart(vch, use_container_width=True)
+    if out.v.sum() > 0:
+        st.altair_chart(vch, use_container_width=True)
+    else:
+        st.caption("No volume data returned for this range.")
 
 
 def _color_bp(v):
-    if pd.isna(v):
+    """Green for a gain, red for a loss. Works on numbers and on already formatted text like '+12.3'."""
+    try:
+        x = float(str(v).replace(",", "").replace("x", ""))
+    except ValueError:
         return ""
-    return "color: #16a34a; font-weight: 600" if v > 0 else "color: #dc2626; font-weight: 600"
+    if pd.isna(x) or x == 0:
+        return ""
+    return "color: #16a34a; font-weight: 600" if x > 0 else "color: #dc2626; font-weight: 600"
+
+
+def txt(s, f, empty="-"):
+    """Numbers to text so empty cells show '-' (Streamlit shows 'None' for empty number cells)."""
+    return pd.to_numeric(s, errors="coerce").map(lambda v: empty if pd.isna(v) else f.format(v))
 
 
 def read_table(sql, args=()):
@@ -716,8 +733,9 @@ def intraday_tab():
     d = t[t.day == dsel].copy()
     sm = sectors_cached()
     show = pd.DataFrame({"Time": d.t_in, "Stock": d.sym, "Sector": d.sym.map(sm).fillna(""), "Side": d.side,
-                         "Entry": d.entry, "Strength": d.ratio, "Exit": d.exit, "Result (bp)": d.bp})
-    sty = (show.style.format({"Entry": "{:,.2f}", "Exit": "{:,.2f}", "Strength": "{:.1f}x", "Result (bp)": "{:+.1f}"}, na_rep="open")
+                         "Entry": txt(d.entry, "{:,.2f}"), "Strength": txt(d.ratio, "{:.1f}x"), "Exit": txt(d.exit, "{:,.2f}", "open"),
+                         "Result (bp)": txt(d.bp, "{:+.1f}", "open")})
+    sty = (show.style
            .map(_color_bp, subset=["Result (bp)"])
            .map(lambda v: "color: #16a34a" if v == "BUY" else "color: #dc2626", subset=["Side"]))
     st.dataframe(sty, hide_index=True, use_container_width=True)
@@ -775,11 +793,10 @@ def swing_tab():
     cl, cs = st.columns(2)
     for col, side, ttl in ((cl, "BUY", "Long (buy)"), (cs, "SELL", "Short (sell)")):
         x = w[w.side == side]
-        num = lambda s: pd.to_numeric(s, errors="coerce")                   # empty columns come back as None; make them numbers
-        show = pd.DataFrame({"Stock": x.sym, "Sector": x.sym.map(sm).fillna(""), "Entry": num(x.entry), "Exit": num(x.exit), "Result (bp)": num(x.bp)})
+        show = pd.DataFrame({"Stock": x.sym, "Sector": x.sym.map(sm).fillna(""), "Entry": txt(x.entry, "{:,.2f}"),
+                             "Exit": txt(x.exit, "{:,.2f}"), "Result (bp)": txt(x.bp, "{:+.1f}")})
         col.markdown(f"**{ttl}**")
-        col.dataframe(show.style.format({"Entry": "{:,.2f}", "Exit": "{:,.2f}", "Result (bp)": "{:+.1f}"}, na_rep="-")
-                      .map(_color_bp, subset=["Result (bp)"]), hide_index=True, use_container_width=True)
+        col.dataframe(show.style.map(_color_bp, subset=["Result (bp)"]), hide_index=True, use_container_width=True)
     if w.bp.notna().any():
         st.caption(f"Week of {wsel}: per trade {w.bp.mean():+.1f} bp (long {w[w.side == 'BUY'].bp.mean():+.1f}, short {w[w.side == 'SELL'].bp.mean():+.1f})")
     elif w.entry.notna().any():
