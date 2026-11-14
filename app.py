@@ -662,6 +662,95 @@ def fno_swing3_job(K=10, minn=40):
         h["analysis"] = f"Swing exit test failed: {e}"
 
 
+def fno_xs_job(K=10, minn=40):
+    """INTRADAY MARKET-NEUTRAL RANKING (fixed rules, nothing fitted): at 10:15 rank every F&O stock by its move since 09:20
+    relative to the average stock, scaled by its own volatility. Long the top K, short the bottom K, enter 10:20, exit at the close.
+    A negative result means the opposite (reversal) is the effect."""
+    h = hist_state()
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        if len(syms) < 5:
+            h["analysis"] = "Not enough F&O data yet."
+            return
+        DY, RM, VV, RT, R0 = [], [], [], [], []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Running intraday ranking test... loading stock {n_ + 1}/{len(syms)} ({sy})"
+            with LOCK:
+                c = db()
+                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+                c.close()
+            days = np.array([r[0] for r in rows])
+            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+            ix = np.where(np.isnan(C), 0, np.arange(75))
+            C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+            C, days = C[ok], days[ok]
+            if len(days) < 30:
+                continue
+            D = C[:, -1]
+            dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+            vs = pd.Series(dr).rolling(20).std().shift(1).to_numpy()          # volatility known before today
+            good = np.isfinite(vs) & (vs > 1e-4)
+            DY.append(days[good])
+            RM.append((C[good, 11] / C[good, 0] - 1))                          # 09:20 -> 10:15 move
+            VV.append(vs[good])
+            RT.append((C[good, -1] / C[good, 12] - 1) * 1e4)                   # enter 10:20, exit at the close
+            R0.append((C[good, -1] / C[good, 11] - 1) * 1e4)                   # no-delay version (enter 10:15), diagnostic only
+        DY, RM, VV, RT, R0 = (np.concatenate(x) for x in (DY, RM, VV, RT, R0))
+        sc = (RM - pd.Series(RM).groupby(DY).transform("mean").to_numpy()) / VV
+        order = np.argsort(DY, kind="stable")
+        DY, sc, RT, R0 = DY[order], sc[order], RT[order], R0[order]
+        ud, st_ = np.unique(DY, return_index=True)
+        en = list(st_[1:]) + [len(DY)]
+        recs = []
+        for d, s0, e0 in zip(ud, st_, en):
+            if e0 - s0 < minn:
+                continue
+            o = np.argsort(sc[s0:e0])
+            r, r0 = RT[s0:e0], R0[s0:e0]
+            recs.append((d, o[-K:], o[:K], r, r0))
+        if len(recs) < 50:
+            h["analysis"] = "Intraday ranking test: too few days."
+            return
+        L = np.array([r[t].mean() for _, t, b, r, _ in recs])
+        S = np.array([-r[b].mean() for _, t, b, r, _ in recs])
+        M = np.array([r.mean() for *_, r, _ in recs])
+        P = (L + S) / 2
+        P0 = np.array([(r0[t].mean() - r0[b].mean()) / 2 for _, t, b, _, r0 in recs])
+        yy = np.array([d[:4] for d, *_ in recs])
+        yrs = [y for y in sorted(set(yy)) if (yy == y).sum() >= 20]
+        rg = np.random.default_rng(17)
+        nul = []
+        for _ in range(400):
+            x = 0.0
+            for _, t, b, r, _ in recs:
+                rp = r[rg.permutation(len(r))]
+                x += (rp[t].mean() - rp[b].mean()) / 2
+            nul.append(x / len(recs))
+        nul = np.array(nul)
+        tt = lambda a: a.mean() / (a.std() / np.sqrt(len(a)) + 1e-9)
+        out = [f"INTRADAY MARKET-NEUTRAL RANKING: at 10:15 rank ~{int(np.mean([len(r) for *_, r, _ in recs]))} F&O stocks by their 09:20-10:15 move vs the average stock (scaled by own volatility)",
+               f"  long the top {K}, short the bottom {K}, enter 10:20, exit at the close.  {len(recs)} days, years {', '.join(yrs)}. Nothing is fitted, so every year is out-of-sample.",
+               f"  average per trade (long and short together): {P.mean():+.1f} bp, daily t-stat {tt(P):+.1f}, days positive {(P > 0).mean() * 100:.0f}%",
+               f"  (a NEGATIVE number means the opposite works: buy the morning losers, sell the morning winners = reversal)",
+               f"  luck check (outcomes shuffled among stocks each day, 400 runs): average {nul.mean():+.1f} bp, middle 95% {np.percentile(nul, 2.5):+.1f} to {np.percentile(nul, 97.5):+.1f};  "
+               f"real result is outside the luck range: {'YES' if (P.mean() > np.percentile(nul, 97.5) or P.mean() < np.percentile(nul, 2.5)) else 'no'}",
+               f"  long leg (morning winners): {L.mean():+.1f} bp vs the average stock {M.mean():+.1f} (so {L.mean() - M.mean():+.1f} over the market);  short leg (morning losers): {S.mean():+.1f} bp",
+               "  by year: " + "  ".join(f"{y}: {P[yy == y].mean():+.1f} bp (t {tt(P[yy == y]):+.1f}, {int((yy == y).sum())} days)" for y in yrs),
+               "  after a round-trip cost per trade of:  " + "   ".join(f"{k} bp: {abs(P.mean()) - k:+.1f}" for k in (5, 10, 15)) + "   (using the stronger direction)",
+               f"  diagnostic, entering at 10:15 with no delay: {P0.mean():+.1f} bp (if this is much bigger, the effect fades within 5 minutes)",
+               f"  worst day {P.min():+.0f} bp, best day {P.max():+.0f} bp;  best 10 days make {np.sort(P * np.sign(P.mean()))[::-1][:10].sum() / abs(P.sum()) * 100:.0f}% of the total",
+               "",
+               "  Real only if: outside the luck range, |daily t-stat| above 3, the same sign in EVERY year, and still positive after 10 bp.",
+               "  Shorting intraday is allowed in cash (MIS) or futures. One fixed design, not tuned. Not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Intraday ranking test failed: {e}"
+
+
 # ======================= Weekly swing paper list (forward test of SWING v2) =======================
 SW_K = 10          # stocks long and stocks short each week
 SW_MIN = 40        # need at least this many stocks with data on the decision day
@@ -1075,7 +1164,9 @@ if st.button("4) Run SWING v2 (market-neutral, long top 10 / short bottom 10)"):
 if st.button("5) Run SWING exit test (hold vs take profit 3/4/5% vs stop-loss 3%)"):
     threading.Thread(target=fno_swing3_job, daemon=True).start()
     _hs["analysis"] = "Running swing exit test... (a few minutes)"
-# (button 5 now also tests a 3% stop-loss)
+if st.button("6) Run INTRADAY ranking test (market-neutral, long top 10 / short bottom 10 at 10:15)"):
+    threading.Thread(target=fno_xs_job, daemon=True).start()
+    _hs["analysis"] = "Running intraday ranking test... (a few minutes)"
 
 
 @st.fragment(run_every=5)
