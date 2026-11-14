@@ -214,10 +214,20 @@ def fno_bt_job(symbol):
                     sgn, y_ = np.sign(pred[r_, f]), Yr[te][r_, f]
                     rat = np.abs(pred[r_, f]) / thr
                     yd = Y1[te][r_, f] if rep == 0 else y_
-                    for dd, s_, yy, rr, y1, k_ in zip(days[te][has], sgn[has], y_[has], rat[has], yd[has], f[has] + 12):
-                        res[rep].append((dd, s_ * yy, s_, yy, sy, rr, s_ * y1, k_))
+                    px = np.full(len(f), np.nan)
+                    stp = np.full((len(f), 3), np.nan)
+                    if rep == 0:                                  # stop-loss test: path of each confident trade (5-min closes)
+                        Cte = C[te]
+                        px = Cte[r_, f + 12]
+                        for i in np.where(has & (rat >= 1.7))[0]:
+                            R = sgn[i] * (Cte[i, f[i] + 13:] / px[i] - 1) * 1e4
+                            for q, S in enumerate((100, 150, 200)):
+                                hit = R <= -S
+                                stp[i, q] = R[hit.argmax()] if hit.any() else R[-1]
+                    for dd, s_, yy, rr, y1, k_, p_, q_ in zip(days[te][has], sgn[has], y_[has], rat[has], yd[has], f[has] + 12, px[has], stp[has]):
+                        res[rep].append((dd, s_ * yy, s_, yy, sy, rr, s_ * y1, k_, p_, q_[0], q_[1], q_[2]))
         def stat(L):
-            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym", "rat", "pnl1", "k"])
+            a = pd.DataFrame(L, columns=["day", "pnl", "side", "raw", "sym", "rat", "pnl1", "k", "px", "s1", "s2", "s3"])
             g = a.groupby("day").pnl.mean()
             return a, g.mean(), g.mean() / (g.std() / np.sqrt(len(g)) + 1e-9)
         a, m0, t0 = stat(res[0])
@@ -263,6 +273,23 @@ def fno_bt_job(symbol):
                     "  net per trade after round-trip cost:  " + "   ".join(f"{k} bp: {b.pnl.mean() - k:+.1f}" for k in (5, 8, 10, 15)),
                     f"  concentration: top 10 stocks make {tp.head(10).sum() / len(b) * 100:.0f}% of the trades;  best 5 days make {dsum.head(5).sum() / dsum.sum() * 100:.0f}% of total profit;  average of the worse 95% of days: {keep.mean():+.1f} bp",
                     "  by entry time: " + "  ".join(f"{hh}h: {b[(555 + 5 * b.k) // 60 == hh].pnl.mean():+.1f} bp (n={int(((555 + 5 * b.k) // 60 == hh).sum())})" for hh in (10, 11, 12, 13, 14))]
+        bq = a[(a.rat >= 1.7) & a.px.notna()]
+        if len(bq) >= 50:
+            cols = [("no stop", "pnl"), ("stop 100", "s1"), ("stop 150", "s2"), ("stop 200", "s3")]
+            out += ["", "STOP-LOSS AND PRICE FILTER TEST (signals at least 1.7x; 4 price filters x 4 exit rules = 16 fixed combinations, none picked after the fact):",
+                    "  stop-loss is checked on 5-min closes only (a real stop fills worse in fast moves, and no volume data is stored, so the filter is by share price).",
+                    "  numbers = average bp per trade: before cost / after a 10 bp round-trip cost"]
+            for pmin in (0, 200, 500, 1000):
+                bb = bq[bq.px >= pmin]
+                if len(bb) < 30:
+                    continue
+                out.append(f"  share price above Rs {pmin}: {len(bb):,} trades ({len(bb) / bb.day.nunique():.1f} per day)")
+                out.append("    " + "   ".join(f"{nm}: {bb[c].mean():+.1f} / {bb[c].mean() - 10:+.1f}" for nm, c in cols))
+                out.append("    worst single trade:  " + "   ".join(f"{nm}: {bb[c].min():+.0f}" for nm, c in cols) +
+                           f";  stopped out: 100bp {((bb.s1 - bb.pnl).abs() > 1e-6).mean() * 100:.0f}%, 150bp {((bb.s2 - bb.pnl).abs() > 1e-6).mean() * 100:.0f}%, 200bp {((bb.s3 - bb.pnl).abs() > 1e-6).mean() * 100:.0f}%")
+                for nm, c in (("no stop", "pnl"), ("stop 150", "s2")):
+                    out.append(f"    by year, {nm}: " + "  ".join(f"{y}: {bb[bb.yr == y][c].mean():+.1f} (n={int((bb.yr == y).sum())})" for y in sorted(set(bb.yr))))
+            out.append("  Judge by: better than 'no stop' in EVERY year, not just on average. With 16 combinations one can look good by chance.")
         out += ["", "  (Strong signals earn more, which is what a real effect looks like. Still check: circuit-limit stocks, wide spreads, F&O ban list.)"]
         h["analysis"] = "\n".join(out)
     except Exception as e:
@@ -415,12 +442,16 @@ def live_close(now):
         op = c.execute("SELECT sym, side, entry FROM fnopaper WHERE day=? AND exit IS NULL", (d_s,)).fetchall()
         c.close()
     bps = []
+    if not ls["ids"]:
+        ls["ids"] = fno_ids()
     for sy, side, entry in op:
         try:
             arr = day_bars(ls["ids"][sy], now.date())
             time.sleep(0.12)
             ok = arr[~np.isnan(arr)]
             if not len(ok):
+                ls["note"] = f"close: no bars for {sy}, will retry"
+                print("close: no bars", sy, flush=True)
                 continue
             bp = (1 if side == "BUY" else -1) * (ok[-1] / entry - 1) * 1e4
             with LOCK:
@@ -431,8 +462,10 @@ def live_close(now):
             bps.append(bp)
         except Exception as e:
             ls["note"] = f"close error {sy}: {str(e)[:100]}"
+            print("close error", sy, e, flush=True)
     if bps:
         send_telegram(f"PAPER RESULTS today: {len(bps)} trades, average {np.mean(bps):+.1f} bp, best {max(bps):+.0f}, worst {min(bps):+.0f}. Research, not advice.")
+    return len(op) - len(bps)                                     # trades still open
 
 
 def live_loop():
@@ -452,9 +485,11 @@ def live_loop():
                     if kmax > ls["scanned"] or ls.get("scanned_day") != d_s:
                         ls["scanned"], ls["scanned_day"] = kmax, d_s
                         live_scan(now)
-                if mnow >= 15 * 60 + 31 and ls["closed"] != d_s and ls["models"]:
-                    ls["closed"] = d_s
-                    live_close(now)
+                if mnow >= 15 * 60 + 31 and ls["closed"] != d_s and (mnow - ls.get("close_try", 0) >= 3):
+                    ls["close_try"] = mnow
+                    left = live_close(now)                                  # retry every 3 min until every exit is saved
+                    if not left or mnow >= 18 * 60:
+                        ls["closed"] = d_s
                 if mnow >= 15 * 60 + 45 and ls["hist"] != d_s and CID and TOKEN:
                     ls["hist"] = d_s
                     fno_job(5)
@@ -534,6 +569,9 @@ if st.button("Send test Telegram"):
         st.success("Test sent")
     else:
         st.error(f"Failed: {info}")
+if st.button("Close today's open paper trades now (use after 15:30)"):
+    left = live_close(datetime.now(IST).replace(tzinfo=None))
+    st.info(f"Done. Still open: {left}. {live_state()['note']}")
 st.caption("If the box does not update, reload the page. The work continues on the server.")
 
 # === END OF app.py (if you do not see this line at the bottom, the paste was cut off) ===
