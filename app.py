@@ -595,55 +595,79 @@ def sectors_cached():
     return sector_map()
 
 
-@st.cache_data(ttl=90, show_spinner=False)
-def day_ohlc(sid, day_s):
-    """One stock's 5-min candles (open, high, low, close, volume) for one day, fetched from Dhan when a chart is opened."""
-    day = datetime.strptime(day_s, "%Y-%m-%d").date()
-    body = {"securityId": sid, "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "interval": "5", "oi": False,
-            "fromDate": day_s, "toDate": (day + timedelta(days=1)).strftime("%Y-%m-%d")}
-    j = hist_post(body, path="/charts/intraday")
-    j = j.get("data") or j
-    ts = j.get("timestamp") or []
-    if not ts:
-        return pd.DataFrame()
-    off = 315532800 if datetime.fromtimestamp(ts[0], IST).year < 2020 else 0
-    vol = j.get("volume") or [0] * len(ts)
-    rows = []
-    for i, t_ in enumerate(ts):
-        x = datetime.fromtimestamp(t_ + off, IST)
-        if x.date() == day and 555 <= x.hour * 60 + x.minute < 930:
-            rows.append((x.strftime("%Y-%m-%dT%H:%M:00Z"), j["open"][i], j["high"][i], j["low"][i], j["close"][i], vol[i]))
-    return pd.DataFrame(rows, columns=["t", "o", "h", "l", "c", "v"])
+TIMEFRAMES = {"5 min": 5, "15 min": 15, "30 min": 30, "1 hour": 60, "1 day": "D"}
 
 
-def candle_chart(df, day_s, side, t_in, entry, exit_):
-    """Altair candlestick with volume, the entry marker (at the bar that closed at the entry time) and the exit marker."""
+@st.cache_data(ttl=120, show_spinner=False)
+def range_5m(sid, from_s, to_s):
+    """One stock's 5-min candles (open, high, low, close, volume) from Dhan for a date range (fetched when a chart is opened)."""
+    d0, d1 = datetime.strptime(from_s, "%Y-%m-%d").date(), datetime.strptime(to_s, "%Y-%m-%d").date()
+    rows, a = [], d0
+    while a <= d1:
+        b = min(a + timedelta(days=80), d1)
+        body = {"securityId": sid, "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "interval": "5", "oi": False,
+                "fromDate": a.strftime("%Y-%m-%d"), "toDate": (b + timedelta(days=1)).strftime("%Y-%m-%d")}
+        j = hist_post(body, path="/charts/intraday")
+        j = j.get("data") or j
+        ts = j.get("timestamp") or []
+        if ts:
+            off = 315532800 if datetime.fromtimestamp(ts[0], IST).year < 2020 else 0
+            vol = j.get("volume") or [0] * len(ts)
+            for i, t_ in enumerate(ts):
+                x = datetime.fromtimestamp(t_ + off, IST).replace(tzinfo=None)
+                if a <= x.date() <= b and 555 <= x.hour * 60 + x.minute < 930:
+                    rows.append((x, j["open"][i], j["high"][i], j["low"][i], j["close"][i], vol[i]))
+        a = b + timedelta(days=1)
+    df = pd.DataFrame(rows, columns=["dt", "o", "h", "l", "c", "v"])
+    return df.drop_duplicates("dt").sort_values("dt").reset_index(drop=True)
+
+
+def bar_key(ts, tf):
+    """Which candle (of timeframe tf) a 5-min bar starting at ts belongs to, as sortable text."""
+    if tf == "D":
+        return ts.strftime("%Y-%m-%d")
+    m = (ts.hour * 60 + ts.minute - 555) // tf * tf + 555
+    return f"{ts:%Y-%m-%d} {m // 60:02d}:{m % 60:02d}"
+
+
+def resample(df, tf):
+    k = df.dt.map(lambda x: bar_key(x, tf))
+    out = df.groupby(k, sort=True).agg(o=("o", "first"), h=("h", "max"), l=("l", "min"), c=("c", "last"), v=("v", "sum")).reset_index(names="key")
+    multi = df.dt.dt.date.nunique() > 1
+    out["lbl"] = out.key.str[5:10] if tf == "D" else (out.key.str[5:] if multi else out.key.str[11:])
+    out["lbl"] = out.lbl.str.replace("-", "/", regex=False)
+    return out
+
+
+def candles(out, marks, hline=None):
+    """Candlestick (no gaps for nights or weekends) + volume. marks: list of dicts with key, p, text, shape."""
     import altair as alt
-    df = df.copy()
-    df["dir"] = np.where(df.c >= df.o, "up", "down")
+    out = out.copy()
+    out["dir"] = np.where(out.c >= out.o, "up", "down")
     col = alt.Color("dir:N", scale=alt.Scale(domain=["up", "down"], range=["#16a34a", "#dc2626"]), legend=None)
-    x = alt.X("t:T", timeUnit="utchoursminutes", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0))
-    tip = [alt.Tooltip("t:T", timeUnit="utchoursminutes", format="%H:%M", title="Time"),
-           alt.Tooltip("o:Q", title="Open", format=",.2f"), alt.Tooltip("h:Q", title="High", format=",.2f"),
-           alt.Tooltip("l:Q", title="Low", format=",.2f"), alt.Tooltip("c:Q", title="Close", format=",.2f"),
-           alt.Tooltip("v:Q", title="Volume", format=",.0f")]
-    base = alt.Chart(df).encode(x=x)
+    x = alt.X("lbl:O", sort=list(out.lbl), title=None, axis=alt.Axis(labelOverlap="greedy", labelAngle=0 if len(out) <= 30 else -40))
+    tip = [alt.Tooltip("lbl:O", title="Bar"), alt.Tooltip("o:Q", title="Open", format=",.2f"), alt.Tooltip("h:Q", title="High", format=",.2f"),
+           alt.Tooltip("l:Q", title="Low", format=",.2f"), alt.Tooltip("c:Q", title="Close", format=",.2f"), alt.Tooltip("v:Q", title="Volume", format=",.0f")]
+    base = alt.Chart(out).encode(x=x)
     layers = [base.mark_rule().encode(y=alt.Y("l:Q", scale=alt.Scale(zero=False), title=None), y2="h:Q", color=col, tooltip=tip),
-              base.mark_bar(size=5).encode(y="o:Q", y2="c:Q", color=col, tooltip=tip)]
-    mk = []
-    if entry:
-        et = (datetime.strptime(f"{day_s} {t_in}", "%Y-%m-%d %H:%M") - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:00Z")
-        mk.append({"t": et, "p": float(entry), "lab": f"{side} {entry:,.2f}", "sh": "triangle-up" if side == "BUY" else "triangle-down"})
-        layers.append(alt.Chart(pd.DataFrame({"p": [float(entry)]})).mark_rule(strokeDash=[4, 4], color="#2563eb").encode(y="p:Q"))
-    if exit_ and not pd.isna(exit_):
-        mk.append({"t": df.t.iloc[-1], "p": float(exit_), "lab": f"EXIT {exit_:,.2f}", "sh": "square"})
+              base.mark_bar().encode(y="o:Q", y2="c:Q", color=col, tooltip=tip)]
+    if hline:
+        layers.append(alt.Chart(pd.DataFrame({"p": [float(hline)]})).mark_rule(strokeDash=[4, 4], color="#2563eb").encode(y="p:Q"))
+    lab = dict(zip(out.key, out.lbl))
+    mk = [{"lbl": lab[m["key"]], "p": float(m["p"]), "text": m["text"], "sh": m["shape"]} for m in marks if m["key"] in lab and pd.notna(m["p"])]
     if mk:
         m = alt.Chart(pd.DataFrame(mk)).encode(x=x, y="p:Q")
         layers += [m.mark_point(filled=True, size=170, color="#2563eb", opacity=1).encode(shape=alt.Shape("sh:N", scale=None)),
-                   m.mark_text(dy=-16, fontWeight="bold", color="#2563eb").encode(text="lab:N")]
+                   m.mark_text(dy=-16, fontWeight="bold", color="#2563eb").encode(text="text:N")]
     price = alt.layer(*layers).properties(height=340)
-    vol = base.mark_bar(size=5, opacity=0.6).encode(y=alt.Y("v:Q", title="Volume", axis=alt.Axis(format="~s")), color=col, tooltip=tip).properties(height=90)
+    vol = base.mark_bar(opacity=0.6).encode(y=alt.Y("v:Q", title="Volume", axis=alt.Axis(format="~s")), color=col, tooltip=tip).properties(height=90)
     return price, vol
+
+
+def show_candles(out, marks, hline=None):
+    pch, vch = candles(out, marks, hline)
+    st.altair_chart(pch, use_container_width=True)
+    st.altair_chart(vch, use_container_width=True)
 
 
 def _color_bp(v):
@@ -699,17 +723,22 @@ def intraday_tab():
     st.dataframe(sty, hide_index=True, use_container_width=True)
     if d.bp.notna().any():
         st.caption(f"{dsel}: {int(d.bp.notna().sum())} closed, average {d.bp.mean():+.1f} bp, right {(d.bp.dropna() > 0).mean() * 100:.0f}%")
-    sym = st.selectbox("Candle chart (5-min)", list(d.sym), key="i_sym")
+    cc1, cc2 = st.columns([2, 3])
+    sym = cc1.selectbox("Candle chart", list(d.sym), key="i_sym")
+    tfn = cc2.radio("Timeframe", ["5 min", "15 min", "30 min"], horizontal=True, key="i_tf")
     r = d[d.sym == sym].iloc[0]
     try:
         ids = ls["ids"] or ids_cached()
-        cdf = day_ohlc(ids[sym], dsel)
-        if cdf.empty:
+        raw = range_5m(ids[sym], dsel, dsel)
+        if raw.empty:
             st.caption("No candles returned for this day yet.")
         else:
-            pch, vch = candle_chart(cdf, dsel, r.side, r.t_in, r.entry, r.exit)
-            st.altair_chart(pch, use_container_width=True)
-            st.altair_chart(vch, use_container_width=True)
+            tf = TIMEFRAMES[tfn]
+            out = resample(raw, tf)
+            ent = datetime.strptime(f"{dsel} {r.t_in}", "%Y-%m-%d %H:%M") - timedelta(minutes=5)   # the bar that closed at the entry time
+            marks = [{"key": bar_key(ent, tf), "p": r.entry, "text": f"{r.side} {r.entry:,.2f}", "shape": "triangle-up" if r.side == "BUY" else "triangle-down"},
+                     {"key": out.key.iloc[-1], "p": r.exit, "text": f"EXIT {r.exit:,.2f}" if pd.notna(r.exit) else "", "shape": "square"}]
+            show_candles(out, marks, r.entry)
             st.caption(f"{sym}: {r.side} at {r.t_in} ({r.entry:,.2f}), signal {r.ratio:.1f}x"
                        + (f", exit 15:25 at {r.exit:,.2f} = {r.bp:+.1f} bp" if pd.notna(r.bp) else ", still open"))
     except Exception as e:
@@ -746,7 +775,8 @@ def swing_tab():
     cl, cs = st.columns(2)
     for col, side, ttl in ((cl, "BUY", "Long (buy)"), (cs, "SELL", "Short (sell)")):
         x = w[w.side == side]
-        show = pd.DataFrame({"Stock": x.sym, "Sector": x.sym.map(sm).fillna(""), "Entry": x.entry, "Exit": x.exit, "Result (bp)": x.bp})
+        num = lambda s: pd.to_numeric(s, errors="coerce")                   # empty columns come back as None; make them numbers
+        show = pd.DataFrame({"Stock": x.sym, "Sector": x.sym.map(sm).fillna(""), "Entry": num(x.entry), "Exit": num(x.exit), "Result (bp)": num(x.bp)})
         col.markdown(f"**{ttl}**")
         col.dataframe(show.style.format({"Entry": "{:,.2f}", "Exit": "{:,.2f}", "Result (bp)": "{:+.1f}"}, na_rep="-")
                       .map(_color_bp, subset=["Result (bp)"]), hide_index=True, use_container_width=True)
@@ -756,6 +786,40 @@ def swing_tab():
         st.caption("Open: entered, exits at next Friday's close.")
     else:
         st.caption("Waiting for entry at the next trading morning 09:20.")
+    st.markdown("**Candle chart**")
+    w1, w2, w3 = st.columns([2, 4, 3])
+    sym = w1.selectbox("Stock", list(w.sym), key="s_sym", format_func=lambda s_: f"{s_} ({'long' if (w.side[w.sym == s_] == 'BUY').any() else 'short'})")
+    tfn = w2.radio("Timeframe", list(TIMEFRAMES), index=3, horizontal=True, key="s_tf")
+    back = w3.select_slider("Days before the decision", [5, 10, 20, 40, 60, 90], value=10, key="s_back")
+    r = w[w.sym == sym].iloc[0]
+    try:
+        ids = live_state()["ids"] or ids_cached()
+        d0 = datetime.strptime(wsel, "%Y-%m-%d").date() - timedelta(days=back)
+        d1 = datetime.strptime(r.exit_day, "%Y-%m-%d").date() if isinstance(r.exit_day, str) else datetime.now(IST).date()
+        raw = range_5m(ids[sym], d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"))
+        if raw.empty:
+            st.caption("No candles returned.")
+        else:
+            tf = TIMEFRAMES[tfn]
+            out = resample(raw, tf)
+            day_last = lambda ds: bar_key(raw[raw.dt.dt.strftime("%Y-%m-%d") == ds].dt.max(), tf) if (raw.dt.dt.strftime("%Y-%m-%d") == ds).any() else ""
+            day_first = lambda ds: bar_key(raw[raw.dt.dt.strftime("%Y-%m-%d") == ds].dt.min(), tf) if (raw.dt.dt.strftime("%Y-%m-%d") == ds).any() else ""
+            ent, ext = pd.to_numeric(r.entry, errors="coerce"), pd.to_numeric(r.exit, errors="coerce")
+            marks = [{"key": day_last(wsel), "p": r.ref, "text": "DECIDED", "shape": "circle"}]
+            if pd.notna(ent):
+                marks.append({"key": day_first(r.entry_day), "p": ent, "text": f"{r.side} {ent:,.2f}", "shape": "triangle-up" if r.side == "BUY" else "triangle-down"})
+            if pd.notna(ext):
+                marks.append({"key": day_last(r.exit_day), "p": ext, "text": f"EXIT {ext:,.2f}", "shape": "square"})
+            show_candles(out, marks, ent if pd.notna(ent) else None)
+            if pd.notna(ext):
+                st.caption(f"{sym}: {r.side} {ent:,.2f} on {r.entry_day}, exit {ext:,.2f} on {r.exit_day} = {r.bp:+.1f} bp")
+            elif pd.notna(ent):
+                now_bp = (1 if r.side == "BUY" else -1) * (out.c.iloc[-1] / ent - 1) * 1e4
+                st.caption(f"{sym}: {r.side} {ent:,.2f} on {r.entry_day}, open. Now {out.c.iloc[-1]:,.2f} = {now_bp:+.1f} bp so far")
+            else:
+                st.caption(f"{sym}: decided {wsel} at close {r.ref:,.2f}; entry at the next trading morning 09:20")
+    except Exception as e:
+        st.caption(f"Chart not available: {str(e)[:150]}")
     with st.expander("History by week"):
         if len(dn):
             g = dn.groupby("wk_day").apply(lambda x: pd.Series({"trades": len(x), "per_trade_bp": x.bp.mean(),
