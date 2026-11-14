@@ -421,6 +421,115 @@ def fno_swing_job():
         h["analysis"] = f"Swing backtest failed: {e}"
 
 
+def fno_swing2_job(K=10, minn=40):
+    """SWING v2 (one fixed design, not tuned): every week, rank all F&O stocks by a model that predicts the move OVER the
+    market; long the top K, short the bottom K; enter next morning, exit the close of the 5th day. Market-neutral by design."""
+    h = hist_state()
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        if len(syms) < 5:
+            h["analysis"] = "Not enough F&O data yet. Run 'Download all F&O stocks' first."
+            return
+        F, FW, V, DY = [], [], [], []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Running swing v2... loading stock {n_ + 1}/{len(syms)} ({sy})"
+            with LOCK:
+                c = db()
+                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+                c.close()
+            days = np.array([r[0] for r in rows])
+            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+            ix = np.where(np.isnan(C), 0, np.arange(75))
+            C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+            C, days = C[ok], days[ok]
+            n = len(days)
+            if n < 200:
+                continue
+            O, D = C[:, 0], C[:, -1]
+            sh = lambda a, k: np.concatenate([np.full(k, np.nan), a[:-k]])
+            dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+            sD = pd.Series(D)
+            vs = pd.Series(dr).rolling(20).std().to_numpy()
+            mx, mn, ma = sD.rolling(20).max().to_numpy(), sD.rolling(20).min().to_numpy(), sD.rolling(20).mean().to_numpy()
+            v = np.maximum(vs, 1e-4)
+            feats = [(D / sh(D, k) - 1) / v for k in (1, 3, 5, 10, 20, 60)]
+            feats += [(sh(D, 20) / sh(D, 120) - 1) / v,                      # 6-month momentum skipping the last month
+                      (D - mn) / (mx - mn + 1e-9), (D / ma - 1) / v, (O / sh(D, 1) - 1) / v, (D / O - 1) / v,
+                      (C[:, -1] / C[:, -13] - 1) / v, np.log(v)]
+            fwd = np.full(n, np.nan)
+            fwd[:n - 5] = D[5:] / O[1:n - 4] - 1
+            dd = days.astype("datetime64[D]")
+            span = np.full(n, 99.0)
+            span[:n - 5] = (dd[5:] - dd[:-5]).astype(float)
+            X = np.stack(feats, 1)
+            valid = np.isfinite(fwd) & np.isfinite(vs) & (span <= 11) & (np.arange(n) >= 120) & np.isfinite(X).all(1)
+            F.append(np.clip(X[valid], -8, 8))
+            FW.append(fwd[valid])
+            V.append(v[valid])
+            DY.append(days[valid])
+        F, FW, V, DY = np.concatenate(F), np.concatenate(FW), np.concatenate(V), np.concatenate(DY)
+        F = (pd.DataFrame(F) - pd.DataFrame(F).groupby(DY).transform("mean")).to_numpy()     # each feature relative to that day's average stock
+        mk = pd.Series(FW).groupby(DY).transform("mean").to_numpy()
+        yx = np.clip((FW - mk) / V, -8, 8)                                  # target: move over the market, in the stock's own volatility units
+        yr = np.array([x[:4] for x in DY])
+        years = sorted(set(yr))[2:]
+        du = pd.DataFrame({"d": sorted(set(DY))})
+        du["wk"] = pd.to_datetime(du.d).dt.strftime("%G-%V")
+        wmask = np.isin(DY, du.groupby("wk").d.max().to_numpy())             # last trading day of each week = decision day
+        weeks = []
+        for Z in years:
+            tr, te = yr < Z, (yr == Z) & wmask
+            mu, sd = F[tr].mean(0), F[tr].std(0) + 1e-9
+            A = (F[tr] - mu) / sd
+            w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(A.shape[1]), A.T @ (yx[tr] - yx[tr].mean()))
+            gi = np.where(te)[0]
+            pred = ((F[gi] - mu) / sd) @ w
+            dte = DY[gi]
+            for d in sorted(set(dte)):
+                m = dte == d
+                if m.sum() < minn:
+                    continue
+                p, r = pred[m], FW[gi[m]] * 1e4
+                o = np.argsort(p)
+                weeks.append((d, Z, o[-K:], o[:K], r))
+        if len(weeks) < 20:
+            h["analysis"] = "Swing v2: too few test weeks."
+            return
+        L = np.array([r[t].mean() for _, _, t, b, r in weeks])
+        S = np.array([-r[b].mean() for _, _, t, b, r in weeks])
+        M = np.array([r.mean() for _, _, t, b, r in weeks])
+        Pn = (L + S) / 2                                                    # average gain per trade (long and short legs together)
+        wy = np.array([z for _, z, _, _, _ in weeks])
+        rg = np.random.default_rng(11)
+        nul = []
+        for _ in range(400):
+            x = []
+            for _, _, t, b, r in weeks:
+                rp = r[rg.permutation(len(r))]
+                x.append((rp[t].mean() - rp[b].mean()) / 2)
+            nul.append(np.mean(x))
+        tst = lambda a: a.mean() / (a.std() / np.sqrt(len(a)) + 1e-9)
+        out = [f"F&O SWING v2 (market-neutral long/short): every week long the top {K}, short the bottom {K} of ~{int(np.mean([len(r) for *_, r in weeks]))} stocks",
+               f"  decide at the close of the week's last trading day, enter next morning 09:20, exit the close of the 5th day. Test years {', '.join(years)}, {len(weeks)} weeks",
+               "  model: ridge on 13 price features (1/3/5/10/20/60-day moves, 6-month momentum, range position, gap, intraday), all relative to that day's average stock",
+               f"  average gain per trade (long and short together): {Pn.mean():+.1f} bp, weekly t-stat {tst(Pn):+.1f}, weeks positive {np.mean(Pn > 0) * 100:.0f}%",
+               f"  luck check (same picks, outcomes shuffled among stocks, 400 runs): average {np.mean(nul):+.1f} bp, 95th percentile {np.percentile(nul, 95):+.1f};  real result beats {np.mean(np.array(nul) < Pn.mean()) * 100:.0f}% of them",
+               f"  long leg: {L.mean():+.1f} bp per trade (the average stock that week: {M.mean():+.1f}, so over the market {L.mean() - M.mean():+.1f});  short leg: {S.mean():+.1f} bp per trade",
+               "  by year: " + "  ".join(f"{y}: {Pn[wy == y].mean():+.1f} bp (weeks {int((wy == y).sum())})" for y in years),
+               "  net per trade after a round-trip cost of:  " + "   ".join(f"{k} bp: {Pn.mean() - k:+.1f}" for k in (5, 10, 20)),
+               f"  worst week {Pn.min():+.0f} bp, best {Pn.max():+.0f} bp;  best 5 weeks make {np.sort(Pn)[::-1][:5].sum() / Pn.sum() * 100:.0f}% of total profit",
+               "",
+               "  Real only if: it beats the luck check (above about 95%), weekly t-stat above 3, every year positive, positive after 10 bp.",
+               "  Shorting needs stock futures (margin). This is ONE fixed design, so a lucky result is still possible. Not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Swing v2 failed: {e}"
+
+
 # ======================= Live paper alerts =======================
 SIG_MIN = float(os.environ.get("SIG_MIN", "1.7"))      # alert only when the signal is at least this many times the entry threshold
 STRONG = 2.5
@@ -647,6 +756,9 @@ if st.button("2) Run backtest"):
 if st.button("3) Run SWING backtest (hold 1 week)"):
     threading.Thread(target=fno_swing_job, daemon=True).start()
     _hs["analysis"] = "Running swing backtest... (a few minutes)"
+if st.button("4) Run SWING v2 (market-neutral, long top 10 / short bottom 10)"):
+    threading.Thread(target=fno_swing2_job, daemon=True).start()
+    _hs["analysis"] = "Running swing v2... (a few minutes)"
 
 
 @st.fragment(run_every=5)
