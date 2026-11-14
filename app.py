@@ -89,8 +89,11 @@ def fno_job(days):
         with LOCK:
             c = db()
             c.execute("CREATE TABLE IF NOT EXISTS fnod(sym TEXT, day TEXT, b BLOB, PRIMARY KEY(sym, day))")
+            # fnov = the same 5-min bars' HIGH, LOW and VOLUME (3 x 75 float32 per stock per day). Days count as
+            # downloaded only when they are in fnov too, so one full run fills volume for the old history.
+            c.execute("CREATE TABLE IF NOT EXISTS fnov(sym TEXT, day TEXT, b BLOB, PRIMARY KEY(sym, day))")
             have = {}
-            for sy, dd in c.execute("SELECT sym, day FROM fnod"):
+            for sy, dd in c.execute("SELECT sym, day FROM fnov"):
                 have.setdefault(sy, set()).add(dd)
             c.commit()
             c.close()
@@ -116,18 +119,25 @@ def fno_job(days):
                     j = hist_post(body, path="/charts/intraday")
                     j = j.get("data") or j
                     ts, cl = j.get("timestamp") or [], j.get("close") or []
+                    hi, lo, vo = j.get("high") or [], j.get("low") or [], j.get("volume") or []
                     if ts:
                         off = 315532800 if datetime.fromtimestamp(ts[0], IST).year < 2020 else 0
-                        dd = {}
-                        for t_, v_ in zip(ts, cl):
+                        dd, dv = {}, {}
+                        for i_, (t_, v_) in enumerate(zip(ts, cl)):
                             x = datetime.fromtimestamp(t_ + off, IST)
                             k = (x.hour * 60 + x.minute - 555) // 5
                             if x.weekday() < 5 and 0 <= k < 75:
                                 dd.setdefault(f"{x:%Y-%m-%d}", np.full(75, np.nan, np.float32))[k] = v_
+                                hv = dv.setdefault(f"{x:%Y-%m-%d}", np.full((3, 75), np.nan, np.float32))
+                                hv[0, k] = hi[i_] if i_ < len(hi) and hi[i_] is not None else np.nan
+                                hv[1, k] = lo[i_] if i_ < len(lo) and lo[i_] is not None else np.nan
+                                hv[2, k] = vo[i_] if i_ < len(vo) and vo[i_] is not None else np.nan
                         rows = [(sy, k_, v_.tobytes()) for k_, v_ in dd.items() if np.isfinite(v_).sum() >= 70]
+                        rowv = [(sy, k_, dv[k_].tobytes()) for k_, v_ in dd.items() if np.isfinite(v_).sum() >= 70]
                         with LOCK:
                             c = db()
                             c.executemany("INSERT OR REPLACE INTO fnod VALUES(?,?,?)", rows)
+                            c.executemany("INSERT OR REPLACE INTO fnov VALUES(?,?,?)", rowv)
                             c.commit()
                             c.close()
                         h["rows"] += len(rows)
