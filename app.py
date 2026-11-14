@@ -629,9 +629,12 @@ def fno_swing3_job(K=10, minn=40):
                 for tp in TPS:
                     hit = R >= tp
                     row += [float(tp) if hit.any() else R[-1], bool(hit.any()), int(hit.argmax() // 75 + 1) if hit.any() else 5]
+                hs = R <= -300                                              # stop-loss at -3%
+                row += [-300.0 if hs.any() else R[-1], R[hs.argmax()] if hs.any() else R[-1], bool(hs.any()), int(hs.argmax() // 75 + 1) if hs.any() else 5]
                 rec.append(row)
-        a = pd.DataFrame(rec, columns=["wk", "yr", "side", "hold", "p3", "h3", "d3", "p4", "h4", "d4", "p5", "h5", "d5"])
-        rules = [("hold 5 days", "hold", None, None), ("take profit +3%", "p3", "h3", "d3"), ("take profit +4%", "p4", "h4", "d4"), ("take profit +5%", "p5", "h5", "d5")]
+        a = pd.DataFrame(rec, columns=["wk", "yr", "side", "hold", "p3", "h3", "d3", "p4", "h4", "d4", "p5", "h5", "d5", "sl", "slr", "hsl", "dsl"])
+        rules = [("hold 5 days", "hold", None, None), ("take profit +3%", "p3", "h3", "d3"), ("take profit +4%", "p4", "h4", "d4"), ("take profit +5%", "p5", "h5", "d5"),
+                 ("STOP-LOSS -3%, filled at -3% (ideal)", "sl", "hsl", "dsl"), ("STOP-LOSS -3%, filled at the 5-min close that breaks it (more realistic)", "slr", "hsl", "dsl")]
         wkh = a.groupby("wk").hold.mean()
         out = [f"F&O SWING EXIT TEST: same weekly long {K} / short {K} lists as SWING v2, enter next morning 09:20; only the exit differs",
                f"  {len(a):,} trades over {wn} weeks, test years {', '.join(years)}. A target is checked on 5-min closes and filled AT the target (an ideal limit order).",
@@ -642,10 +645,10 @@ def fno_swing3_job(K=10, minn=40):
             line = (f"  {nm}: {a[pc].mean():+.1f} bp per trade, weekly t {tt(wk):+.1f}, weeks positive {(wk > 0).mean() * 100:.0f}%, "
                     f"after 10 bp cost {a[pc].mean() - 10:+.1f}")
             if hc:
-                line += f";  target hit on {a[hc].mean() * 100:.0f}% of trades (on average day {a.loc[a[hc], dc].mean():.1f} of 5)"
+                line += f";  triggered on {a[hc].mean() * 100:.0f}% of trades (on average day {a.loc[a[hc], dc].mean():.1f} of 5)"
             out.append(line)
             out.append("     by year: " + "  ".join(f"{y}: {a[a.yr == y][pc].mean():+.1f}" for y in years) +
-                       f";  long {a[a.side > 0][pc].mean():+.1f}, short {a[a.side < 0][pc].mean():+.1f};  best 5 weeks make {np.sort(wk.to_numpy())[::-1][:5].sum() / wk.sum() * 100:.0f}% of profit")
+                       f";  long {a[a.side > 0][pc].mean():+.1f}, short {a[a.side < 0][pc].mean():+.1f};  best 5 weeks make {np.sort(wk.to_numpy())[::-1][:5].sum() / wk.sum() * 100:.0f}% of profit;  worst trade {a[pc].min():+.0f} bp")
         out.append("")
         for nm, pc, hc, dc in rules[1:]:
             df = a.groupby("wk")[pc].mean() - wkh
@@ -653,7 +656,7 @@ def fno_swing3_job(K=10, minn=40):
             out.append(f"  {nm} minus hold: {df.mean():+.1f} bp per trade per week, t {tt(df):+.1f};  by year: " +
                        "  ".join(f"{y}: {yrs[y]:+.1f}" for y in years))
         out += ["", "  Worth using only if the target beats 'hold' in EVERY year, the difference t-stat is above 2, and it stays positive after 10 bp.",
-                "  Three targets tested, so a small gain can be chance. Targets are filled at the exact level; real fills can be a bit worse. Not advice."]
+                "  Four exit rules tested, so a small gain can be chance. Ideal fills are at the exact level; real fills can be worse (see the 'more realistic' stop line). Not advice."]
         h["analysis"] = "\n".join(out)
     except Exception as e:
         h["analysis"] = f"Swing exit test failed: {e}"
@@ -1069,9 +1072,10 @@ if st.button("3) Run SWING backtest (hold 1 week)"):
 if st.button("4) Run SWING v2 (market-neutral, long top 10 / short bottom 10)"):
     threading.Thread(target=fno_swing2_job, daemon=True).start()
     _hs["analysis"] = "Running swing v2... (a few minutes)"
-if st.button("5) Run SWING exit test (hold vs take profit 3/4/5%)"):
+if st.button("5) Run SWING exit test (hold vs take profit 3/4/5% vs stop-loss 3%)"):
     threading.Thread(target=fno_swing3_job, daemon=True).start()
     _hs["analysis"] = "Running swing exit test... (a few minutes)"
+# (button 5 now also tests a 3% stop-loss)
 
 
 @st.fragment(run_every=5)
