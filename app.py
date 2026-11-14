@@ -297,6 +297,128 @@ def fno_bt_job(symbol):
 
 
 
+def fno_swing_job():
+    """SWING backtest: one price model for all F&O stocks, decided at the close, enter next morning (09:20 price),
+    hold 5 trading days, exit at the close of the 5th day. Walk-forward by year, one open trade per stock at a time."""
+    h = hist_state()
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        if len(syms) < 5:
+            h["analysis"] = "Not enough F&O data yet. Run 'Download all F&O stocks' first."
+            return
+        F, YN, YR, DY, SY, TT = [], [], [], [], [], []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Running swing backtest... loading stock {n_ + 1}/{len(syms)} ({sy})"
+            with LOCK:
+                c = db()
+                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+                c.close()
+            days = np.array([r[0] for r in rows])
+            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+            ix = np.where(np.isnan(C), 0, np.arange(75))
+            C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+            C, days = C[ok], days[ok]
+            n = len(days)
+            if n < 150:
+                continue
+            O, D = C[:, 0], C[:, -1]
+            sh = lambda a, k: np.concatenate([np.full(k, np.nan), a[:-k]])
+            dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+            sD = pd.Series(D)
+            vs = pd.Series(dr).rolling(20).std().to_numpy()
+            mx, mn, ma = sD.rolling(20).max().to_numpy(), sD.rolling(20).min().to_numpy(), sD.rolling(20).mean().to_numpy()
+            v = np.maximum(vs, 1e-4)
+            feats = [(D / sh(D, k) - 1) / v for k in (1, 3, 5, 10, 20)]
+            feats += [(D - mn) / (mx - mn + 1e-9), (D / ma - 1) / v, (O / sh(D, 1) - 1) / v, (D / O - 1) / v,
+                      (C[:, -1] / C[:, -13] - 1) / v, np.log(v)]
+            fwd = np.full(n, np.nan)
+            fwd[:n - 5] = D[5:] / O[1:n - 4] - 1                    # enter next day 09:20, exit close of day t+5
+            dd = days.astype("datetime64[D]")
+            span = np.full(n, 99.0)
+            span[:n - 5] = (dd[5:] - dd[:-5]).astype(float)
+            valid = np.isfinite(fwd) & np.isfinite(vs) & np.isfinite(mx) & (span <= 11) & (np.arange(n) >= 20)
+            X = np.stack(feats, 1)
+            valid &= np.isfinite(X).all(1)
+            F.append(np.clip(X[valid], -8, 8))
+            YN.append(np.clip(fwd[valid] / v[valid], -8, 8))
+            YR.append(fwd[valid] * 1e4)
+            DY.append(days[valid])
+            SY.append(np.full(valid.sum(), n_))
+            TT.append(np.where(valid)[0])
+        F, YN, YR = np.concatenate(F), np.concatenate(YN), np.concatenate(YR)
+        DY, SY, TT = np.concatenate(DY), np.concatenate(SY), np.concatenate(TT)
+        yr = np.array([x[:4] for x in DY])
+        years = sorted(set(yr))[2:]
+        mkt = pd.Series(YR).groupby(DY).mean()                                # average 5-day move of ALL stocks from each day
+
+        def run(yn, yr_raw):
+            res = []
+            for Z in years:
+                tr, te = yr < Z, yr == Z
+                mu, sd = F[tr].mean(0), F[tr].std(0) + 1e-9
+                A = (F[tr] - mu) / sd
+                w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(A.shape[1]), A.T @ (yn[tr] - yn[tr].mean()))
+                thr = np.percentile(np.abs(A @ w), 90)
+                pred = ((F[te] - mu) / sd) @ w
+                gi = np.where(te)[0]
+                last, sel = {}, []
+                for j in np.where(np.abs(pred) >= thr)[0]:
+                    g = gi[j]
+                    if SY[g] in last and TT[g] < last[SY[g]] + 5:
+                        continue                                            # that stock's previous trade is still open
+                    last[SY[g]] = TT[g]
+                    sel.append((DY[g], SY[g], np.sign(pred[j]), abs(pred[j]) / thr, yr_raw[g]))
+                res += sel
+            a = pd.DataFrame(res, columns=["day", "s", "side", "rat", "raw"])
+            a["pnl"] = a.side * a.raw
+            return a
+
+        rg = np.random.default_rng(5)
+        nulls = []
+        for k in range(3):
+            h["analysis"] = f"Running swing backtest... luck check {k + 1}/3"
+            p = rg.permutation(len(YN))
+            nulls.append(run(YN[p], YR[p]).pnl.mean())
+        h["analysis"] = "Running swing backtest... real run"
+        a = run(YN, YR)
+        a["yr"] = a.day.str[:4]
+        a["wk"] = pd.to_datetime(a.day).dt.strftime("%G-%V")
+        a["mk"] = a.day.map(mkt)
+        a["ex"] = a.side * (a.raw - a.mk)                                    # gain over simply holding the average F&O stock
+        gw = a.groupby("wk").pnl.mean()
+        tw = gw.mean() / (gw.std() / np.sqrt(len(gw)) + 1e-9)
+        out = [f"F&O SWING BACKTEST: signal at the close, enter next morning (09:20 price), hold 5 trading days, exit at the close. Test years {', '.join(years)}",
+               f"  {len(syms)} stocks, one price model for all (moves scaled by each stock's own volatility), walk-forward by year, one open trade per stock",
+               f"  {len(a):,} trades over {a.wk.nunique()} weeks = about {len(a) / a.wk.nunique():.0f} new trades per week",
+               f"  average per trade: {a.pnl.mean():+.1f} bp, right {(a.pnl > 0).mean() * 100:.0f}%, median {a.pnl.median():+.1f} bp",
+               f"  per WEEK average {gw.mean():+.1f} bp, t-stat {tw:+.1f} (each week counted once);  scrambled outcomes (luck), 3 runs: {np.mean(nulls):+.1f} bp, highest {max(nulls):+.1f}",
+               "  by year: " + "  ".join(f"{y}: {a[a.yr == y].pnl.mean():+.1f} bp (n={int((a.yr == y).sum())})" for y in years),
+               f"  BUY trades: {a[a.side > 0].pnl.mean():+.1f} bp (n={int((a.side > 0).sum())});  SELL trades: {a[a.side < 0].pnl.mean():+.1f} bp (n={int((a.side < 0).sum())})",
+               f"  market check: the average F&O stock itself gained {mkt.mean():+.1f} bp per 5-day window; the model's gain OVER the market (excess) is {a.ex.mean():+.1f} bp per trade",
+               "  by confidence: " + "  ".join(f"{lo}-{hi}x: {a[(a.rat >= lo) & (a.rat < hi)].pnl.mean():+.1f} bp (n={int(((a.rat >= lo) & (a.rat < hi)).sum())})"
+                                              for lo, hi in ((1, 1.3), (1.3, 1.7), (1.7, 2.5), (2.5, 99))),
+               "  net per trade after a round-trip cost of:  " + "   ".join(f"{k} bp: {a.pnl.mean() - k:+.1f}" for k in (5, 10, 20, 30)),
+               f"  worst trade {a.pnl.min():+.0f} bp, best {a.pnl.max():+.0f} bp;  best 5 weeks make {gw.sort_values(ascending=False).head(5).sum() / gw.sum() * 100:.0f}% of total profit",
+               f"  concentration: top 10 stocks make {a.groupby('s').size().sort_values(ascending=False).head(10).sum() / len(a) * 100:.0f}% of the trades"]
+        for lo in (1.7, 2.5):
+            b = a[a.rat >= lo]
+            if len(b) < 50:
+                continue
+            gb = b.groupby("wk").pnl.mean()
+            out += ["", f"STRONG SIGNALS ONLY (at least {lo}x):",
+                    f"  {len(b):,} trades, about {len(b) / b.wk.nunique():.1f} per week on {b.wk.nunique()} weeks;  average {b.pnl.mean():+.1f} bp, right {(b.pnl > 0).mean() * 100:.0f}%",
+                    f"  per WEEK average {gb.mean():+.1f} bp, t-stat {gb.mean() / (gb.std() / np.sqrt(len(gb)) + 1e-9):+.1f};  over the market: {b.ex.mean():+.1f} bp",
+                    "  by year: " + "  ".join(f"{y}: {b[b.yr == y].pnl.mean():+.1f} bp (n={int((b.yr == y).sum())})" for y in years),
+                    f"  BUY {b[b.side > 0].pnl.mean():+.1f} bp,  SELL {b[b.side < 0].pnl.mean():+.1f} bp;  after 10 bp cost {b.pnl.mean() - 10:+.1f}, after 20 bp {b.pnl.mean() - 20:+.1f}"]
+        out += ["", "  Real only if: per-week average clearly beats the scrambled runs, the gain OVER the market is positive,",
+                "  every year is positive and it stays positive after realistic costs (futures about 10 bp, delivery shares more). Not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Swing backtest failed: {e}"
 
 
 # ======================= Live paper alerts =======================
@@ -522,6 +644,9 @@ if st.button("1) Download all F&O stocks 5-min (long, run after 15:30)", disable
 if st.button("2) Run backtest"):
     threading.Thread(target=fno_bt_job, args=("NIFTY",), daemon=True).start()
     _hs["analysis"] = "Running F&O backtest... (a few minutes)"
+if st.button("3) Run SWING backtest (hold 1 week)"):
+    threading.Thread(target=fno_swing_job, daemon=True).start()
+    _hs["analysis"] = "Running swing backtest... (a few minutes)"
 
 
 @st.fragment(run_every=5)
