@@ -530,6 +530,305 @@ def fno_swing2_job(K=10, minn=40):
         h["analysis"] = f"Swing v2 failed: {e}"
 
 
+def fno_swing3_job(K=10, minn=40):
+    """SWING v2 weekly lists, same entry, but compare exit rules: hold 5 days vs take profit at +3%, +4%, +5% (whichever comes first)."""
+    h = hist_state()
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        if len(syms) < 5:
+            h["analysis"] = "Not enough F&O data yet."
+            return
+
+        def clean(sy):
+            with LOCK:
+                c = db()
+                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+                c.close()
+            days = np.array([r[0] for r in rows])
+            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+            ix = np.where(np.isnan(C), 0, np.arange(75))
+            C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+            return days[ok], C[ok]
+
+        F, FW, V, DY, TT, SI = [], [], [], [], [], []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Running swing exit test... loading stock {n_ + 1}/{len(syms)} ({sy})"
+            days, C = clean(sy)
+            n = len(days)
+            if n < 200:
+                continue
+            O, D = C[:, 0], C[:, -1]
+            sh = lambda a, k: np.concatenate([np.full(k, np.nan), a[:-k]])
+            dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+            sD = pd.Series(D)
+            vs = pd.Series(dr).rolling(20).std().to_numpy()
+            mx, mn, ma = sD.rolling(20).max().to_numpy(), sD.rolling(20).min().to_numpy(), sD.rolling(20).mean().to_numpy()
+            v = np.maximum(vs, 1e-4)
+            feats = [(D / sh(D, k) - 1) / v for k in (1, 3, 5, 10, 20, 60)]
+            feats += [(sh(D, 20) / sh(D, 120) - 1) / v, (D - mn) / (mx - mn + 1e-9), (D / ma - 1) / v, (O / sh(D, 1) - 1) / v,
+                      (D / O - 1) / v, (C[:, -1] / C[:, -13] - 1) / v, np.log(v)]
+            fwd = np.full(n, np.nan)
+            fwd[:n - 5] = D[5:] / O[1:n - 4] - 1
+            dd = days.astype("datetime64[D]")
+            span = np.full(n, 99.0)
+            span[:n - 5] = (dd[5:] - dd[:-5]).astype(float)
+            X = np.stack(feats, 1)
+            valid = np.isfinite(fwd) & np.isfinite(vs) & (span <= 11) & (np.arange(n) >= 120) & np.isfinite(X).all(1)
+            F.append(np.clip(X[valid], -8, 8))
+            FW.append(fwd[valid])
+            V.append(v[valid])
+            DY.append(days[valid])
+            TT.append(np.where(valid)[0])
+            SI.append(np.full(valid.sum(), n_))
+        F, FW, V, DY, TT, SI = (np.concatenate(x) for x in (F, FW, V, DY, TT, SI))
+        F = (pd.DataFrame(F) - pd.DataFrame(F).groupby(DY).transform("mean")).to_numpy()
+        mk = pd.Series(FW).groupby(DY).transform("mean").to_numpy()
+        yx = np.clip((FW - mk) / V, -8, 8)
+        yr = np.array([x[:4] for x in DY])
+        years = sorted(set(yr))[2:]
+        du = pd.DataFrame({"d": sorted(set(DY))})
+        du["wk"] = pd.to_datetime(du.d).dt.strftime("%G-%V")
+        wmask = np.isin(DY, du.groupby("wk").d.max().to_numpy())
+        trades = []                                                        # (week no, year, side, row)
+        wn = 0
+        for Z in years:
+            tr, te = yr < Z, (yr == Z) & wmask
+            mu, sd = F[tr].mean(0), F[tr].std(0) + 1e-9
+            A = (F[tr] - mu) / sd
+            w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(A.shape[1]), A.T @ (yx[tr] - yx[tr].mean()))
+            gi = np.where(te)[0]
+            pred = ((F[gi] - mu) / sd) @ w
+            dte = DY[gi]
+            for d in sorted(set(dte)):
+                m = dte == d
+                if m.sum() < minn:
+                    continue
+                gm, o = gi[m], np.argsort(pred[m])
+                trades += [(wn, Z, 1, g) for g in gm[o[-K:]]] + [(wn, Z, -1, g) for g in gm[o[:K]]]
+                wn += 1
+        if wn < 20:
+            h["analysis"] = "Swing exit test: too few test weeks."
+            return
+        TPS = (300, 400, 500)
+        rec = []
+        bysym = {}
+        for wk_, Z, sd_, g in trades:
+            bysym.setdefault(SI[g], []).append((wk_, Z, sd_, g))
+        for k_, (si, lst) in enumerate(bysym.items()):
+            h["analysis"] = f"Running swing exit test... paths {k_ + 1}/{len(bysym)}"
+            days, C = clean(syms[si])
+            for wk_, Z, sd_, g in lst:
+                t = TT[g]
+                ent = C[t + 1, 0]
+                R = sd_ * (C[t + 1:t + 6].ravel()[1:] / ent - 1) * 1e4
+                row = [wk_, Z, sd_, R[-1]]
+                for tp in TPS:
+                    hit = R >= tp
+                    row += [float(tp) if hit.any() else R[-1], bool(hit.any()), int(hit.argmax() // 75 + 1) if hit.any() else 5]
+                rec.append(row)
+        a = pd.DataFrame(rec, columns=["wk", "yr", "side", "hold", "p3", "h3", "d3", "p4", "h4", "d4", "p5", "h5", "d5"])
+        rules = [("hold 5 days", "hold", None, None), ("take profit +3%", "p3", "h3", "d3"), ("take profit +4%", "p4", "h4", "d4"), ("take profit +5%", "p5", "h5", "d5")]
+        wkh = a.groupby("wk").hold.mean()
+        out = [f"F&O SWING EXIT TEST: same weekly long {K} / short {K} lists as SWING v2, enter next morning 09:20; only the exit differs",
+               f"  {len(a):,} trades over {wn} weeks, test years {', '.join(years)}. A target is checked on 5-min closes and filled AT the target (an ideal limit order).",
+               ""]
+        tt = lambda s: s.mean() / (s.std() / np.sqrt(len(s)) + 1e-9)
+        for nm, pc, hc, dc in rules:
+            wk = a.groupby("wk")[pc].mean()
+            line = (f"  {nm}: {a[pc].mean():+.1f} bp per trade, weekly t {tt(wk):+.1f}, weeks positive {(wk > 0).mean() * 100:.0f}%, "
+                    f"after 10 bp cost {a[pc].mean() - 10:+.1f}")
+            if hc:
+                line += f";  target hit on {a[hc].mean() * 100:.0f}% of trades (on average day {a.loc[a[hc], dc].mean():.1f} of 5)"
+            out.append(line)
+            out.append("     by year: " + "  ".join(f"{y}: {a[a.yr == y][pc].mean():+.1f}" for y in years) +
+                       f";  long {a[a.side > 0][pc].mean():+.1f}, short {a[a.side < 0][pc].mean():+.1f};  best 5 weeks make {np.sort(wk.to_numpy())[::-1][:5].sum() / wk.sum() * 100:.0f}% of profit")
+        out.append("")
+        for nm, pc, hc, dc in rules[1:]:
+            df = a.groupby("wk")[pc].mean() - wkh
+            yrs = a.groupby("yr").apply(lambda x: x[pc].mean() - x.hold.mean())
+            out.append(f"  {nm} minus hold: {df.mean():+.1f} bp per trade per week, t {tt(df):+.1f};  by year: " +
+                       "  ".join(f"{y}: {yrs[y]:+.1f}" for y in years))
+        out += ["", "  Worth using only if the target beats 'hold' in EVERY year, the difference t-stat is above 2, and it stays positive after 10 bp.",
+                "  Three targets tested, so a small gain can be chance. Targets are filled at the exact level; real fills can be a bit worse. Not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Swing exit test failed: {e}"
+
+
+# ======================= Weekly swing paper list (forward test of SWING v2) =======================
+SW_K = 10          # stocks long and stocks short each week
+SW_MIN = 40        # need at least this many stocks with data on the decision day
+
+
+def swing_build(syms):
+    """Features for every stock-day (same as SWING v2) plus the target where the 5-day outcome is already known."""
+    F, FW, V, DY, SY, DC = [], [], [], [], [], []
+    for sy in syms:
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+            c.close()
+        days = np.array([r[0] for r in rows])
+        C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+        if not len(C):
+            continue
+        ix = np.where(np.isnan(C), 0, np.arange(75))
+        C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+        ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+        C, days = C[ok], days[ok]
+        n = len(days)
+        if n < 200:
+            continue
+        O, D = C[:, 0], C[:, -1]
+        sh = lambda a, k: np.concatenate([np.full(k, np.nan), a[:-k]])
+        dr = np.concatenate([[np.nan], D[1:] / D[:-1] - 1])
+        sD = pd.Series(D)
+        vs = pd.Series(dr).rolling(20).std().to_numpy()
+        mx, mn, ma = sD.rolling(20).max().to_numpy(), sD.rolling(20).min().to_numpy(), sD.rolling(20).mean().to_numpy()
+        v = np.maximum(vs, 1e-4)
+        feats = [(D / sh(D, k) - 1) / v for k in (1, 3, 5, 10, 20, 60)]
+        feats += [(sh(D, 20) / sh(D, 120) - 1) / v, (D - mn) / (mx - mn + 1e-9), (D / ma - 1) / v, (O / sh(D, 1) - 1) / v,
+                  (D / O - 1) / v, (C[:, -1] / C[:, -13] - 1) / v, np.log(v)]
+        fwd = np.full(n, np.nan)
+        fwd[:n - 5] = D[5:] / O[1:n - 4] - 1
+        dd = days.astype("datetime64[D]")
+        span = np.full(n, 99.0)
+        span[:n - 5] = (dd[5:] - dd[:-5]).astype(float)
+        X = np.stack(feats, 1)
+        okf = np.isfinite(vs) & (np.arange(n) >= 120) & np.isfinite(X).all(1)
+        F.append(np.clip(X[okf], -8, 8))
+        FW.append(np.where(span <= 11, fwd, np.nan)[okf])
+        V.append(v[okf])
+        DY.append(days[okf])
+        DC.append(D[okf])
+        SY.append(np.array([sy] * int(okf.sum()), dtype=object))
+    F, FW, V, DY, SY, DC = (np.concatenate(x) for x in (F, FW, V, DY, SY, DC))
+    F = (pd.DataFrame(F) - pd.DataFrame(F).groupby(DY).transform("mean")).to_numpy()
+    mk = pd.Series(FW).groupby(DY).transform("mean").to_numpy()
+    return F, np.clip((FW - mk) / V, -8, 8), DY, SY, DC
+
+
+def swing_db():
+    with LOCK:
+        c = db()
+        c.execute("""CREATE TABLE IF NOT EXISTS swingpaper(wk_day TEXT, sym TEXT, side TEXT, ref REAL, entry_day TEXT, entry REAL,
+                     exit_day TEXT, exit REAL, bp REAL, PRIMARY KEY(wk_day, sym))""")
+        c.commit()
+        c.close()
+
+
+def swing_list(now, require_today=True):
+    """Rank every F&O stock with the SWING v2 model; long the top, short the bottom; save and send on Telegram."""
+    ls = live_state()
+    swing_db()
+    with LOCK:
+        c = db()
+        syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+        c.close()
+    F, yx, DY, SY, DC = swing_build(syms)
+    d_last = str(np.unique(DY)[-1])
+    if require_today and d_last != now.strftime("%Y-%m-%d"):
+        ls["note"] = f"weekly list: today's data not stored yet (latest {d_last}), will retry"
+        return False
+    tr = np.isfinite(yx)
+    mu, sd = F[tr].mean(0), F[tr].std(0) + 1e-9
+    A = (F[tr] - mu) / sd
+    w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(A.shape[1]), A.T @ (yx[tr] - yx[tr].mean()))
+    te = np.where(DY == d_last)[0]
+    if len(te) < SW_MIN:
+        ls["note"] = f"weekly list: only {len(te)} stocks have data for {d_last}"
+        return False
+    p = ((F[te] - mu) / sd) @ w
+    o = np.argsort(p)
+    longs, shorts = te[o[-SW_K:]][::-1], te[o[:SW_K]]
+    with LOCK:
+        c = db()
+        for g, side in [(g, "BUY") for g in longs] + [(g, "SELL") for g in shorts]:
+            c.execute("INSERT OR IGNORE INTO swingpaper(wk_day, sym, side, ref) VALUES(?,?,?,?)", (d_last, SY[g], side, float(DC[g])))
+        c.commit()
+        c.close()
+    send_telegram(f"WEEKLY PAPER LIST (data of {d_last}, {len(te)} stocks ranked)\nLONG: {', '.join(SY[longs])}\nSHORT: {', '.join(SY[shorts])}\n"
+                  "Enter next trading morning 09:20, exit next Friday close. Paper only. Research, not advice.")
+    ls["note"] = f"weekly list saved for {d_last}"
+    return True
+
+
+def swing_enter(now):
+    """Next trading morning: record the 09:20 price as the entry of each listed stock. Returns how many are still waiting."""
+    swing_db()
+    d_s = now.strftime("%Y-%m-%d")
+    with LOCK:
+        c = db()
+        pend = c.execute("SELECT wk_day, sym FROM swingpaper WHERE entry IS NULL AND wk_day < ?", (d_s,)).fetchall()
+        c.close()
+    if not pend:
+        return 0
+    ls = live_state()
+    if not ls["ids"]:
+        ls["ids"] = fno_ids()
+    left = 0
+    for wk, sy in pend:
+        try:
+            arr = day_bars(ls["ids"][sy], now.date())
+            time.sleep(0.12)
+            if np.isnan(arr[0]):
+                left += 1
+                continue
+            with LOCK:
+                c = db()
+                c.execute("UPDATE swingpaper SET entry_day=?, entry=? WHERE wk_day=? AND sym=?", (d_s, float(arr[0]), wk, sy))
+                c.commit()
+                c.close()
+        except Exception as e:
+            left += 1
+            ls["note"] = f"swing entry error {sy}: {str(e)[:100]}"
+    return left
+
+
+def swing_exit(now):
+    """Friday after the close: exit last week's list at today's close and send the week's result."""
+    swing_db()
+    d_s = now.strftime("%Y-%m-%d")
+    ls = live_state()
+    with LOCK:
+        c = db()
+        op = c.execute("SELECT wk_day, sym, side, entry FROM swingpaper WHERE entry IS NOT NULL AND exit IS NULL AND wk_day < ?", (d_s,)).fetchall()
+        c.close()
+    if not op:
+        return
+    if not ls["ids"]:
+        ls["ids"] = fno_ids()
+    done = {}
+    for wk, sy, side, entry in op:
+        try:
+            with LOCK:
+                c = db()
+                r = c.execute("SELECT b FROM fnod WHERE sym=? AND day=?", (sy, d_s)).fetchone()
+                c.close()
+            arr = np.frombuffer(r[0], np.float32).astype(float) if r else day_bars(ls["ids"][sy], now.date())
+            ok = arr[~np.isnan(arr)]
+            if not len(ok):
+                continue
+            bp = (1 if side == "BUY" else -1) * (ok[-1] / entry - 1) * 1e4
+            with LOCK:
+                c = db()
+                c.execute("UPDATE swingpaper SET exit_day=?, exit=?, bp=? WHERE wk_day=? AND sym=?", (d_s, float(ok[-1]), float(bp), wk, sy))
+                c.commit()
+                c.close()
+            done.setdefault(wk, []).append((side, bp))
+        except Exception as e:
+            ls["note"] = f"swing exit error {sy}: {str(e)[:100]}"
+    for wk, lst in done.items():
+        lg = [b for s, b in lst if s == "BUY"]
+        sh_ = [b for s, b in lst if s == "SELL"]
+        send_telegram(f"WEEKLY PAPER RESULT (list of {wk}): per trade {np.mean([b for _, b in lst]):+.0f} bp; "
+                      f"long avg {np.mean(lg) if lg else 0:+.0f} bp ({len(lg)}), short avg {np.mean(sh_) if sh_ else 0:+.0f} bp ({len(sh_)}). Research, not advice.")
+
+
 # ======================= Live paper alerts =======================
 SIG_MIN = float(os.environ.get("SIG_MIN", "1.7"))      # alert only when the signal is at least this many times the entry threshold
 STRONG = 2.5
@@ -724,6 +1023,17 @@ def live_loop():
                 if mnow >= 15 * 60 + 45 and ls["hist"] != d_s and CID and TOKEN:
                     ls["hist"] = d_s
                     fno_job(5)
+                if (9 * 60 + 25 <= mnow < 11 * 60 and CID and TOKEN and ls.get("swing_e_day") != d_s
+                        and mnow - ls.get("swing_e", -99) >= 5):                    # weekly list: record entry prices
+                    ls["swing_e"] = mnow
+                    if swing_enter(now) == 0:
+                        ls["swing_e_day"] = d_s
+                if (now.weekday() == 4 and mnow >= 15 * 60 + 50 and ls["hist"] == d_s and ls.get("swing") != d_s
+                        and mnow - ls.get("swing_t", -99) >= 10):                   # Friday: close last week's list, make the next
+                    ls["swing_t"] = mnow
+                    swing_exit(now)
+                    if swing_list(now):
+                        ls["swing"] = d_s
         except Exception as e:
             ls["note"] = f"loop error: {str(e)[:120]}"
         time.sleep(20)
@@ -759,6 +1069,9 @@ if st.button("3) Run SWING backtest (hold 1 week)"):
 if st.button("4) Run SWING v2 (market-neutral, long top 10 / short bottom 10)"):
     threading.Thread(target=fno_swing2_job, daemon=True).start()
     _hs["analysis"] = "Running swing v2... (a few minutes)"
+if st.button("5) Run SWING exit test (hold vs take profit 3/4/5%)"):
+    threading.Thread(target=fno_swing3_job, daemon=True).start()
+    _hs["analysis"] = "Running swing exit test... (a few minutes)"
 
 
 @st.fragment(run_every=5)
@@ -800,6 +1113,40 @@ def live_panel():
 
 
 live_panel()
+
+
+@st.fragment(run_every=60)
+def swing_panel():
+    st.subheader("Weekly swing paper list (forward test of SWING v2)")
+    st.caption(f"Every Friday after 15:50: long the top {SW_K} and short the bottom {SW_K} stocks by the market-neutral model, "
+               "entry next trading morning 09:20, exit next Friday close. Paper only, no money.")
+    try:
+        swing_db()
+        with LOCK:
+            c = db()
+            t = pd.read_sql("SELECT * FROM swingpaper ORDER BY wk_day DESC, side, sym LIMIT 120", c)
+            c.close()
+    except Exception:
+        t = pd.DataFrame()
+    if t.empty:
+        st.caption("No weekly list yet. The first one appears on a Friday after 15:50, or press the button below.")
+        return
+    dn = t[t.bp.notna()]
+    if len(dn):
+        wkr = dn.groupby("wk_day").bp.mean()
+        st.write(f"Finished weeks: {len(wkr)}, average per trade {dn.bp.mean():+.1f} bp, after 10 bp cost {dn.bp.mean() - 10:+.1f} bp, "
+                 f"weeks positive {(wkr > 0).mean() * 100:.0f}%")
+    st.dataframe(t, hide_index=True)
+
+
+swing_panel()
+if st.button("Make the weekly list now (uses the latest stored day)"):
+    with st.spinner("Ranking all stocks..."):
+        try:
+            _ok = swing_list(datetime.now(IST).replace(tzinfo=None), require_today=False)
+            st.info(f"{'Saved' if _ok else 'Not saved'}: {live_state()['note']}")
+        except Exception as _e:
+            st.error(f"Failed: {_e}")
 if st.button("Send test Telegram"):
     ok, info = send_telegram("Test from F&O scanner: Telegram works.")
     if ok:
