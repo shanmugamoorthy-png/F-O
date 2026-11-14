@@ -761,6 +761,15 @@ def fno_xs_job(K=10, minn=40):
         h["analysis"] = f"Intraday ranking test failed: {e}"
 
 
+def sector_map():
+    """Stock -> industry, from NSE's Nifty 500 list saved in the repo as sectors.csv (next to app.py)."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sectors.csv")
+    if not os.path.exists(p):
+        return {}
+    d = pd.read_csv(p)
+    return dict(zip(d["Symbol"].astype(str).str.strip(), d["Industry"].astype(str).str.strip()))
+
+
 # ======================= Weekly swing paper list (forward test of SWING v2) =======================
 SW_K = 10          # stocks long and stocks short each week
 SW_MIN = 40        # need at least this many stocks with data on the decision day
@@ -1192,6 +1201,43 @@ def status():
 
 status()
 ensure_live()
+try:
+    _sm = sector_map()
+    with LOCK:
+        _c = db()
+        _have = [r[0] for r in _c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450")]
+        _c.close()
+    if not _sm:
+        st.caption("Sectors: sectors.csv not found in the repo.")
+    else:
+        _miss = [s for s in _have if s not in _sm]
+        st.caption(f"Sectors: {len(_have) - len(_miss)} of {len(_have)} stocks matched to {len({_sm[s] for s in _have if s in _sm})} industries."
+                   + (f" Not in the list: {', '.join(_miss[:30])}" if _miss else ""))
+except Exception as _e:
+    st.caption(f"Sectors: could not read ({_e})")
+
+
+@st.cache_data(ttl=600)
+def data_check():
+    with LOCK:
+        c = db()
+        a = c.execute("SELECT COUNT(*), COUNT(DISTINCT sym), MIN(day), MAX(day) FROM fnod").fetchone()
+        try:
+            b = c.execute("SELECT COUNT(*), COUNT(DISTINCT sym), MIN(day), MAX(day) FROM fnov").fetchone()
+            r = c.execute("SELECT b FROM fnov ORDER BY day DESC LIMIT 1").fetchone()
+            vtot = float(np.nansum(np.frombuffer(r[0], np.float32).reshape(3, 75)[2])) if r else 0.0
+        except Exception:
+            b, vtot = (0, 0, "-", "-"), 0.0
+        c.close()
+    return a, b, vtot
+
+
+try:
+    _a, _b, _v = data_check()
+    st.caption(f"Stored data: prices {_a[0]:,} stock-days ({_a[1]} stocks, {_a[2]} to {_a[3]});  "
+               f"high/low/volume {_b[0]:,} stock-days ({_b[1]} stocks, {_b[2]} to {_b[3]}); latest day's volume of one stock: {_v:,.0f}  (refreshes every 10 min)")
+except Exception as _e:
+    st.caption(f"Stored data: could not read ({_e})")
 
 
 @st.fragment(run_every=30)
