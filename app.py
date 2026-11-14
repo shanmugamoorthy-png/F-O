@@ -664,7 +664,9 @@ def candles(out, marks, hline=None):
         layers += [m.mark_point(filled=True, size=170, color="#2563eb", opacity=1).encode(shape=alt.Shape("sh:N", scale=None)),
                    m.mark_text(dy=-16, fontWeight="bold", color="#2563eb").encode(text="text:N")]
     price = alt.layer(*layers).properties(height=340)
-    vol = base.mark_bar(opacity=0.6).encode(y=alt.Y("v:Q", title="Volume", axis=alt.Axis(format="~s")), color=col, tooltip=tip).properties(height=90)
+    vol = (alt.Chart(out).mark_bar(opacity=0.6)                               # no date labels here: they squeezed the bars flat
+           .encode(x=alt.X("lbl:O", sort=list(out.lbl), axis=None), y=alt.Y("v:Q", title="Volume", axis=alt.Axis(format="~s", tickCount=3)),
+                   color=col, tooltip=tip).properties(height=170))
     return price, vol
 
 
