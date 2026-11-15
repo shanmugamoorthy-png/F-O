@@ -240,6 +240,74 @@ def swing_build(syms):
     return F, np.clip((FW - mk) / V, -8, 8), DY, SY, DC
 
 
+BIG_SIGMA = 3.0    # a day's move counts as "big" when it is more than 3x the stock's normal daily move (std of the 20 days before)
+
+
+def big_move_tag(D, today_px=None, last=1):
+    """Text tag when a stock just made an unusually big move (results, news). D = daily closes, oldest first.
+    last=1 checks yesterday (intraday alerts); last=5 checks the last 5 days (weekly list)."""
+    D = np.asarray(D, float)
+    D = D[np.isfinite(D) & (D > 0)]
+    if len(D) < 21 + last:
+        return ""
+    dr = D[1:] / D[:-1] - 1
+    sd = float(np.std(dr[-(20 + last):-last]))
+    if sd <= 0:
+        return ""
+    parts = [f"{r * 100:+.1f}%" for r in dr[-last:] if abs(r) > BIG_SIGMA * sd]
+    if parts:
+        parts = [("yesterday " if last == 1 else "") + ", ".join(parts) + ("" if last == 1 else " in the last 5 days")]
+    if today_px:
+        t = today_px / D[-1] - 1
+        if abs(t) > BIG_SIGMA * sd:
+            parts.append(f"today {t * 100:+.1f}%")
+    return ("after big move: " + "; ".join(parts)) if parts else ""
+
+
+def daily_closes(sym, upto, n=30, include=True):
+    """Last n daily closes of a stock up to a day (the day itself included or not)."""
+    with LOCK:
+        c = db()
+        rows = c.execute(f"SELECT b FROM fnod WHERE sym=? AND day {'<=' if include else '<'} ? ORDER BY day DESC LIMIT ?",
+                         (sym, upto, n)).fetchall()
+        c.close()
+    out = []
+    for (b,) in rows[::-1]:
+        a = np.frombuffer(b, np.float32)
+        a = a[np.isfinite(a)]
+        if len(a):
+            out.append(float(a[-1]))
+    return out
+
+
+def _add_col(table, col):
+    with LOCK:
+        c = db()
+        if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            c.commit()
+        c.close()
+
+
+def backfill_tags():
+    """Give old rows (made before tagging existed) their big-move tag. Rows keep '' when there was no big move."""
+    for table, key, last in (("fnopaper", "day", 1), ("swingpaper", "wk_day", 5)):
+        with LOCK:
+            c = db()
+            try:
+                rows = c.execute(f"SELECT {key}, sym, {'entry' if table == 'fnopaper' else 'NULL'} FROM {table} WHERE tag IS NULL").fetchall()
+            except Exception:
+                rows = []
+            c.close()
+        for d_, sy, px in rows:
+            tg = big_move_tag(daily_closes(sy, d_, include=(table == "swingpaper")), px, last=last)
+            with LOCK:
+                c = db()
+                c.execute(f"UPDATE {table} SET tag=? WHERE {key}=? AND sym=?", (tg, d_, sy))
+                c.commit()
+                c.close()
+
+
 def swing_db():
     with LOCK:
         c = db()
@@ -247,6 +315,7 @@ def swing_db():
                      exit_day TEXT, exit REAL, bp REAL, PRIMARY KEY(wk_day, sym))""")
         c.commit()
         c.close()
+    _add_col("swingpaper", "tag")
 
 
 def swing_list(now, require_today=True):
@@ -273,13 +342,18 @@ def swing_list(now, require_today=True):
     p = ((F[te] - mu) / sd) @ w
     o = np.argsort(p)
     longs, shorts = te[o[-SW_K:]][::-1], te[o[:SW_K]]
+    tags = {SY[g]: big_move_tag(daily_closes(SY[g], d_last), last=5) for g in list(longs) + list(shorts)}
     with LOCK:
         c = db()
         for g, side in [(g, "BUY") for g in longs] + [(g, "SELL") for g in shorts]:
-            c.execute("INSERT OR IGNORE INTO swingpaper(wk_day, sym, side, ref) VALUES(?,?,?,?)", (d_last, SY[g], side, float(DC[g])))
+            c.execute("INSERT OR IGNORE INTO swingpaper(wk_day, sym, side, ref, tag) VALUES(?,?,?,?,?)",
+                      (d_last, SY[g], side, float(DC[g]), tags[SY[g]]))
         c.commit()
         c.close()
-    send_telegram(f"WEEKLY PAPER LIST (data of {d_last}, {len(te)} stocks ranked)\nLONG: {', '.join(SY[longs])}\nSHORT: {', '.join(SY[shorts])}\n"
+    nm = lambda g: SY[g] + (" ⚠" if tags[SY[g]] else "")
+    warn = "".join(f"\n⚠ {s_}: {t_}" for s_, t_ in tags.items() if t_)
+    send_telegram(f"WEEKLY PAPER LIST (data of {d_last}, {len(te)} stocks ranked)\nLONG: {', '.join(nm(g) for g in longs)}\n"
+                  f"SHORT: {', '.join(nm(g) for g in shorts)}{warn}\n"
                   "Enter next trading morning 09:20, exit next Friday close. Paper only. Research, not advice.")
     ls["note"] = f"weekly list saved for {d_last}"
     return True
@@ -415,7 +489,8 @@ def live_fit():
         A = (Xt - mu) / sd
         yv = Y3.reshape(-1)
         w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(12), A.T @ (yv - yv.mean()))
-        models[sy] = dict(mu=mu, sd=sd, w=w, thr=float(np.percentile(np.abs(A @ w), 90)), prev=C[-1], prevday=days[-1], id=sid)
+        models[sy] = dict(mu=mu, sd=sd, w=w, thr=float(np.percentile(np.abs(A @ w), 90)), prev=C[-1], prevday=days[-1], id=sid,
+                           dc=C[-30:, -1].copy())
     ls["models"], ls["ids"] = models, ids
     gc.collect()
     ls["busy"] = ""
@@ -429,6 +504,7 @@ def paper_db():
                      t_out TEXT, exit REAL, bp REAL, PRIMARY KEY(day, sym))""")
         c.commit()
         c.close()
+    _add_col("fnopaper", "tag")
 
 
 def live_scan(now):
@@ -473,14 +549,16 @@ def live_scan(now):
                 continue                                          # signal was long ago (service started late): do not chase
             side = "BUY" if (((X[j] - m["mu"]) / m["sd"]) @ m["w"]) > 0 else "SELL"
             t_in = f"{(555 + 5 * k + 5) // 60:02d}:{(555 + 5 * k + 5) % 60:02d}"
+            tag = big_move_tag(m.get("dc", []), float(row[k]), last=1)
             with LOCK:
                 c = db()
-                c.execute("INSERT OR IGNORE INTO fnopaper(day,sym,t_in,side,entry,ratio) VALUES(?,?,?,?,?,?)",
-                          (d_s, sy, t_in, side, float(row[k]), float(ratio[j])))
+                c.execute("INSERT OR IGNORE INTO fnopaper(day,sym,t_in,side,entry,ratio,tag) VALUES(?,?,?,?,?,?,?)",
+                          (d_s, sy, t_in, side, float(row[k]), float(ratio[j]), tag))
                 c.commit()
                 c.close()
             send_telegram(f"PAPER {side} {sy} at {t_in}, price {row[k]:,.2f}. Signal {ratio[j]:.1f}x"
-                          f"{' (STRONG)' if ratio[j] >= STRONG else ''}. Paper trade, exit about 15:25. Research, not advice.")
+                          f"{' (STRONG)' if ratio[j] >= STRONG else ''}. Paper trade, exit about 15:25."
+                          + (f"\n⚠ {tag}: the model was not built for such days." if tag else "") + " Research, not advice.")
             n += 1
         except Exception as e:
             ls["note"] = f"scan error {sy}: {str(e)[:100]}"
@@ -583,6 +661,21 @@ def ensure_live():
 st.set_page_config(page_title="F&O price-model alerts", page_icon="📈", layout="wide")
 _hs = hist_state()
 ensure_live()
+
+
+@st.cache_resource(show_spinner=False)
+def _tables_ready():
+    """Once per server start: make sure both paper tables have the 'tag' column, and tag rows made before tagging existed."""
+    paper_db()
+    swing_db()
+    try:
+        backfill_tags()
+    except Exception:
+        pass
+    return True
+
+
+_tables_ready()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -763,13 +856,19 @@ def intraday_tab():
     c3.metric("Win rate", f"{(dn.bp > 0).mean() * 100:.0f}%" if len(dn) else "-")
     c4.metric("Average per trade", f"{dn.bp.mean():+.1f} bp" if len(dn) else "-")
     c5.metric("After 10 bp cost", f"{dn.bp.mean() - 10:+.1f} bp" if len(dn) else "-")
+    if len(dn):
+        bg = dn.tag.fillna("") != ""
+        st.caption(f"Normal trades: {int((~bg).sum())}, average {dn[~bg].bp.mean() if (~bg).any() else float('nan'):+.1f} bp  ·  "
+                   f"⚠ after a big move: {int(bg.sum())}, average {dn[bg].bp.mean() if bg.any() else float('nan'):+.1f} bp "
+                   f"(a move over {BIG_SIGMA:g}x the stock's normal daily move, e.g. results day)")
     days = list(dict.fromkeys(t.day))
     dsel = st.selectbox("Day", days, index=0, key="i_day")
     d = t[t.day == dsel].copy()
     sm = sectors_cached()
-    show = pd.DataFrame({"Time": d.t_in, "Stock": d.sym, "Sector": d.sym.map(sm).fillna(""), "Side": d.side,
+    tg = d.tag.fillna("")
+    show = pd.DataFrame({"Time": d.t_in, "Stock": d.sym + np.where(tg != "", " ⚠", ""), "Sector": d.sym.map(sm).fillna(""), "Side": d.side,
                          "Entry": txt(d.entry, "{:,.2f}"), "Strength": txt(d.ratio, "{:.1f}x"), "Exit": txt(d.exit, "{:,.2f}", "open"),
-                         "Result (bp)": txt(d.bp, "{:+.1f}", "open")})
+                         "Result (bp)": txt(d.bp, "{:+.1f}", "open"), "Note": tg.str.replace("after big move: ", "big move: ", regex=False)})
     sty = (show.style
            .map(_color_bp, subset=["Result (bp)"])
            .map(lambda v: "color: #16a34a" if v == "BUY" else "color: #dc2626", subset=["Side"]))
@@ -793,7 +892,8 @@ def intraday_tab():
                      {"key": out.key.iloc[-1], "p": r.exit, "text": f"EXIT {r.exit:,.2f}" if pd.notna(r.exit) else "", "shape": "square"}]
             show_candles(out, marks, r.entry)
             st.caption(f"{sym}: {r.side} at {r.t_in} ({r.entry:,.2f}), signal {r.ratio:.1f}x"
-                       + (f", exit 15:25 at {r.exit:,.2f} = {r.bp:+.1f} bp" if pd.notna(r.bp) else ", still open"))
+                       + (f", exit 15:25 at {r.exit:,.2f} = {r.bp:+.1f} bp" if pd.notna(r.bp) else ", still open")
+                       + (f"  ·  ⚠ {r.tag}" if isinstance(r.tag, str) and r.tag else ""))
     except Exception as e:
         st.caption(f"Chart not available: {str(e)[:150]}")
     with st.expander("History by day"):
@@ -828,10 +928,13 @@ def swing_tab():
     cl, cs = st.columns(2)
     for col, side, ttl in ((cl, "BUY", "Long (buy)"), (cs, "SELL", "Short (sell)")):
         x = w[w.side == side]
-        show = pd.DataFrame({"Stock": x.sym, "Sector": x.sym.map(sm).fillna(""), "Entry": txt(x.entry, "{:,.2f}"),
+        show = pd.DataFrame({"Stock": x.sym + np.where(x.tag.fillna("") != "", " ⚠", ""), "Sector": x.sym.map(sm).fillna(""),
+                             "Entry": txt(x.entry, "{:,.2f}"),
                              "Exit": txt(x.exit, "{:,.2f}"), "Result (bp)": txt(x.bp, "{:+.1f}")})
         col.markdown(f"**{ttl}**")
         col.dataframe(show.style.map(_color_bp, subset=["Result (bp)"]), hide_index=True, use_container_width=True)
+    for _, rr in w[w.tag.fillna("") != ""].iterrows():
+        st.caption(f"⚠ {rr.sym} ({'long' if rr.side == 'BUY' else 'short'}): {rr.tag}. The model only sees prices, not results or news.")
     if w.bp.notna().any():
         st.caption(f"Week of {wsel}: per trade {w.bp.mean():+.1f} bp (long {w[w.side == 'BUY'].bp.mean():+.1f}, short {w[w.side == 'SELL'].bp.mean():+.1f})")
     elif w.entry.notna().any():
