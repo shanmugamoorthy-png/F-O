@@ -187,6 +187,177 @@ def sector_map():
     return dict(zip(d["Symbol"].astype(str).str.strip(), d["Industry"].astype(str).str.strip()))
 
 
+# ======================= Research: Donchian channel backtests (run after market hours) =======================
+DC_N, DC_EXIT = 20, 10          # channel length and exit-channel length (classic turtle rules), fixed in advance
+
+
+def _stock_hlc(sy):
+    """5-min high, low, close of one stock for all stored days (days x 75), only days with both prices and high/low."""
+    with LOCK:
+        c = db()
+        rows = c.execute("SELECT d.day, d.b, v.b FROM fnod d JOIN fnov v ON v.sym = d.sym AND v.day = d.day "
+                         "WHERE d.sym=? ORDER BY d.day", (sy,)).fetchall()
+        c.close()
+    if not rows:
+        return None
+    days = np.array([r[0] for r in rows])
+    C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+    HV = np.array([np.frombuffer(r[2], np.float32).reshape(3, 75)[:2] for r in rows], float)
+    ix = np.where(np.isnan(C), 0, np.arange(75))
+    C = np.take_along_axis(C, np.maximum.accumulate(ix, axis=1), axis=1)
+    ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+    C, H, L, days = C[ok], HV[ok, 0], HV[ok, 1], days[ok]
+    H = np.where(np.isfinite(H) & (H >= C), H, C)
+    L = np.where(np.isfinite(L) & (L <= C) & (L > 0), L, C)
+    return days, H, L, C
+
+
+def _roll(a, n, fn):
+    """Value of fn over the previous n items (excluding the current one); NaN where not enough history."""
+    from numpy.lib.stride_tricks import sliding_window_view as swv
+    out = np.full(len(a), np.nan)
+    if len(a) > n:
+        out[n:] = fn(swv(a[:-1], n), axis=-1)
+    return out
+
+
+def _dc_report(title, rules, a, unit_key, extra):
+    tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x)) + 1e-9) if len(x) > 2 else 0.0
+    g = a.groupby(unit_key).pnl.mean()
+    yrs = sorted(set(a.yr))
+    out = [title, rules,
+           f"  {len(a):,} trades on {a.sym.nunique()} stocks, {g.size} {'days' if unit_key == 'day' else 'weeks'}, years {', '.join(yrs)}",
+           f"  average per trade {a.pnl.mean():+.1f} bp, right {(a.pnl > 0).mean() * 100:.0f}%, median {a.pnl.median():+.1f} bp",
+           f"  per {'DAY' if unit_key == 'day' else 'WEEK'} (all trades averaged, each counted once): {g.mean():+.1f} bp, t-stat {tt(g):+.1f}, positive {(g > 0).mean() * 100:.0f}%",
+           "  by year: " + "  ".join(f"{y}: {a[a.yr == y].pnl.mean():+.1f} bp (n={int((a.yr == y).sum())})" for y in yrs),
+           f"  BUY (upper breakout) {a[a.side > 0].pnl.mean():+.1f} bp (n={int((a.side > 0).sum())});  SELL (lower breakdown) {a[a.side < 0].pnl.mean():+.1f} bp (n={int((a.side < 0).sum())})",
+           "  after a round-trip cost of:  " + "   ".join(f"{k} bp: {a.pnl.mean() - k:+.1f}" for k in (5, 10, 20)),
+           f"  best 10 {'days' if unit_key == 'day' else 'weeks'} make {np.sort(g.to_numpy())[::-1][:10].sum() / g.sum() * 100 if g.sum() else 0:.0f}% of the total;  worst trade {a.pnl.min():+.0f} bp"]
+    out += extra
+    out += ["", "  Real only if: t-stat above 3, positive in EVERY year, and still positive after a realistic cost "
+            "(about 10 bp intraday, 10-20 bp for a week). One fixed design, not tuned. Survivorship: today's F&O list. Not advice."]
+    return "\n".join(out)
+
+
+def donchian_intraday_job():
+    """5-min Donchian breakout per stock: close above the highest high of the previous 20 candles = BUY (below the lowest
+    low = SELL), first signal per stock per day between 09:45 and 14:45, enter at that close; exit when a close crosses the
+    10-candle opposite channel, else at the 15:25 close."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Donchian intraday: starting...")
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        rec = []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Donchian intraday: stock {n_ + 1}/{len(syms)} ({sy})"
+            got = _stock_hlc(sy)
+            if got is None or len(got[0]) < 60:
+                continue
+            days, H, L, C = got
+            nd = len(days)
+            hf, lf, cf = H.ravel(), L.ravel(), C.ravel()
+            up, dn = _roll(hf, DC_N, np.max).reshape(nd, 75), _roll(lf, DC_N, np.min).reshape(nd, 75)
+            xl, xh = _roll(lf, DC_EXIT, np.min).reshape(nd, 75), _roll(hf, DC_EXIT, np.max).reshape(nd, 75)
+            ks = np.arange(6, 67)                                          # signal candles closing 09:50 ... 14:50
+            sig = np.where(C[:, ks] > up[:, ks], 1, np.where(C[:, ks] < dn[:, ks], -1, 0))
+            has = (sig != 0).any(1)
+            for d in np.where(has)[0]:
+                j = int(np.argmax(sig[d] != 0))
+                k0, sd = ks[j], int(sig[d, j])
+                e = C[d, k0]
+                rest = C[d, k0 + 1:]
+                hit = (rest < xl[d, k0 + 1:]) if sd == 1 else (rest > xh[d, k0 + 1:])
+                x = rest[hit.argmax()] if hit.any() else C[d, -1]
+                e1 = C[d, k0 + 1]                                          # diagnostic: one candle later
+                rest1 = C[d, k0 + 2:]
+                hit1 = (rest1 < xl[d, k0 + 2:]) if sd == 1 else (rest1 > xh[d, k0 + 2:])
+                x1 = rest1[hit1.argmax()] if hit1.any() else C[d, -1]
+                rec.append((days[d], sy, sd, sd * (x / e - 1) * 1e4, sd * (x1 / e1 - 1) * 1e4, sd * (C[d, -1] / e - 1) * 1e4))
+        a = pd.DataFrame(rec, columns=["day", "sym", "side", "pnl", "pnl_delay", "pnl_close"])
+        if a.empty:
+            h["analysis"] = "Donchian intraday: no trades (is the high/low/volume history downloaded?)"
+            return
+        a["yr"] = a.day.str[:4]
+        extra = ["", f"  entered one candle (5 min) later: {a.pnl_delay.mean():+.1f} bp;  "
+                     f"same entries held to the 15:25 close (no exit rule): {a.pnl_close.mean():+.1f} bp"]
+        h["analysis"] = _dc_report("DONCHIAN INTRADAY (5-min, F&O stocks)",
+                                   f"  BUY on a close above the {DC_N}-candle high, SELL below the {DC_N}-candle low; first signal per stock per day "
+                                   f"09:45-14:45; exit on a close through the {DC_EXIT}-candle opposite channel or at 15:25", a, "day", extra)
+    except Exception as e:
+        h["analysis"] = f"Donchian intraday failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
+def donchian_weekly_job():
+    """Daily Donchian breakout per stock: close above the highest high of the previous 20 days = BUY (below the lowest low =
+    SELL). Enter next morning (09:20 price). Main exit: close of the 5th trading day. Second line: turtle exit (close through
+    the 10-day opposite channel, at most 20 days). One open trade per stock at a time."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Donchian weekly: starting...")
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        rec, allfwd = [], []
+        for n_, sy in enumerate(syms):
+            h["analysis"] = f"Donchian weekly: stock {n_ + 1}/{len(syms)} ({sy})"
+            got = _stock_hlc(sy)
+            if got is None or len(got[0]) < 60:
+                continue
+            days, H, L, C = got
+            D, DH, DL, O1 = C[:, -1], H.max(1), L.min(1), C[:, 0]
+            n = len(D)
+            up, dn = _roll(DH, DC_N, np.max), _roll(DL, DC_N, np.min)
+            xl, xh = _roll(DL, DC_EXIT, np.min), _roll(DH, DC_EXIT, np.max)
+            dd = days.astype("datetime64[D]")
+            fwd = np.full(n, np.nan)
+            fwd[:n - 5] = D[5:] / O1[1:n - 4] - 1                          # enter next morning, exit 5th day close
+            span = np.full(n, 99.0)
+            span[:n - 5] = (dd[5:] - dd[:-5]).astype(float)
+            ok = np.isfinite(fwd) & (span <= 11)
+            allfwd.append(pd.DataFrame({"day": days[ok], "f": fwd[ok] * 1e4}))
+            t = DC_N
+            while t < n - 5:
+                sd = 1 if D[t] > up[t] else (-1 if D[t] < dn[t] else 0)
+                if sd == 0 or not ok[t]:
+                    t += 1
+                    continue
+                e = O1[t + 1]
+                u = t + 1
+                while u < min(n - 1, t + 20) and not ((D[u] < xl[u]) if sd == 1 else (D[u] > xh[u])):
+                    u += 1
+                rec.append((days[t], sy, sd, sd * fwd[t] * 1e4, fwd[t] * 1e4, sd * (D[u] / e - 1) * 1e4, u - t))
+                t += 5                                                     # the 5-day trade is still open until then
+        a = pd.DataFrame(rec, columns=["day", "sym", "side", "pnl", "raw", "pnl_turtle", "turtle_days"])
+        if a.empty:
+            h["analysis"] = "Donchian weekly: no trades."
+            return
+        mk = pd.concat(allfwd).groupby("day").f.mean()
+        a["mk"] = a.day.map(mk)
+        a["ex"] = a.side * (a.raw - a.mk)
+        a["yr"] = a.day.str[:4]
+        a["wk"] = pd.to_datetime(a.day).dt.strftime("%G-%V")
+        extra = ["", f"  market check: the average F&O stock moved {mk.mean():+.1f} bp over the same 5-day windows; "
+                     f"gain OVER the market per trade {a.ex.mean():+.1f} bp (BUY {a[a.side > 0].ex.mean():+.1f}, SELL {a[a.side < 0].ex.mean():+.1f})",
+                 f"  turtle exit instead ({DC_EXIT}-day opposite channel, max 20 days): {a.pnl_turtle.mean():+.1f} bp per trade, "
+                 f"held {a.turtle_days.mean():.1f} days on average;  by year: "
+                 + "  ".join(f"{y}: {a[a.yr == y].pnl_turtle.mean():+.1f}" for y in sorted(set(a.yr)))]
+        h["analysis"] = _dc_report("DONCHIAN WEEKLY (daily candles, F&O stocks)",
+                                   f"  BUY on a daily close above the {DC_N}-day high, SELL below the {DC_N}-day low; enter next morning 09:20; "
+                                   "exit at the close of the 5th trading day", a, "wk", extra)
+    except Exception as e:
+        h["analysis"] = f"Donchian weekly failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
 # ======================= Weekly swing paper list (forward test of SWING v2) =======================
 SW_K = 10          # stocks long and stocks short each week
 SW_MIN = 40        # need at least this many stocks with data on the decision day
@@ -1031,6 +1202,21 @@ def settings_tab():
                 st.info(f"{'Saved' if ok else 'Not saved'}: {live_state()['note']}")
             except Exception as e:
                 st.error(f"Failed: {e}")
+    with st.expander("Research: Donchian channel backtests (run after 15:45 or at the weekend)"):
+        st.caption(f"Classic Donchian/turtle rules, fixed in advance: {DC_N}-candle breakout, {DC_EXIT}-candle opposite-channel exit. "
+                   "Uses the stored 5 years. Takes a few minutes; the live alerts keep running.")
+        _hs.setdefault("an_running", False)
+        r1, r2 = st.columns(2)
+        if r1.button("Run intraday Donchian", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=donchian_intraday_job, daemon=True).start()
+        if r2.button("Run weekly Donchian", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=donchian_weekly_job, daemon=True).start()
+        if _hs.get("analysis"):
+            st.code(_hs["analysis"], language=None)
+            if _hs["an_running"]:
+                st.button("🔄 Refresh result", use_container_width=True)
     with st.expander("Repair history (only if data is missing)"):
         dd = st.number_input("Days back (calendar)", 30, 1800, 30, step=30, help="Already saved days are skipped. Run after 15:30.")
         if st.button("Download missing 5-min history", disabled=_hs["running"]):
