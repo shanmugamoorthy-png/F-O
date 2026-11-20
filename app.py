@@ -239,6 +239,131 @@ def _dc_report(title, rules, a, unit_key, extra):
     return "\n".join(out)
 
 
+# ======================= Research: monthly momentum (fixed rules, set before testing) =======================
+MOM_TOP = 20             # stocks held
+MOM_COST = 25.0          # bp per 100% of the portfolio replaced (delivery: STT 0.1% x2, stamp, exchange, GST, DP)
+
+
+def _daily_panel(progress=None):
+    """Daily 09:20 price and 15:25 close of every stock (days x stocks) from the stored 5-min history."""
+    with LOCK:
+        c = db()
+        syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 200 ORDER BY sym")]
+        c.close()
+    op, cl = {}, {}
+    for n_, sy in enumerate(syms):
+        if progress and n_ % 10 == 0:
+            progress(f"Monthly momentum: loading {n_ + 1}/{len(syms)}")
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+            c.close()
+        o_, c_ = {}, {}
+        for d, b in rows:
+            a = np.frombuffer(b, np.float32)
+            v = a[np.isfinite(a) & (a > 0)]
+            if len(v) >= 30:
+                o_[d], c_[d] = float(v[0]), float(v[-1])
+        op[sy], cl[sy] = pd.Series(o_), pd.Series(c_)
+    O, C = pd.DataFrame(op).sort_index(), pd.DataFrame(cl).sort_index()
+    good = C.notna().sum(1) >= 0.5 * C.shape[1]          # drop thin days (holidays / partial downloads)
+    return O[good], C[good]
+
+
+def momentum_job():
+    """Classic 12-1 momentum, monthly. At each month-end rank stocks by the return from 12 months ago to 1 month ago,
+    buy the top 20 equally at the next trading day's 09:20 price, hold to the next month's first 09:20 price.
+    Compared with holding all F&O stocks equally. Also shown: 6-month momentum and a long-short (top 20 vs bottom 20)."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Monthly momentum: starting...")
+    try:
+        O, C = _daily_panel(lambda m: h.update(analysis=m))
+        days = pd.to_datetime(C.index)
+        mon = days.to_period("M")
+        last_ix = [np.where(mon == m)[0][-1] for m in mon.unique()]       # last trading day of each month
+        rows = []
+        for a_, b_ in zip(last_ix[:-1], last_ix[1:]):
+            t, e, x = a_, a_ + 1, b_ + 1                                     # signal close, entry day, exit day
+            if x >= len(C) or t < 252:
+                continue
+            ent, ext = O.iloc[e], O.iloc[x]
+            r = (ext / ent - 1) * 1e4
+            m12 = C.iloc[t - 21] / C.iloc[t - 252] - 1
+            m6 = C.iloc[t] / C.iloc[t - 126] - 1
+            ok = r.notna() & m12.notna() & m6.notna()
+            if ok.sum() < 60:
+                continue
+            rr, s12, s6 = r[ok].clip(-5000, 5000), m12[ok], m6[ok]
+            top12 = s12.nlargest(MOM_TOP).index
+            bot12 = s12.nsmallest(MOM_TOP).index
+            top6 = s6.nlargest(MOM_TOP).index
+            rows.append({"month": str(mon[e]), "n": int(ok.sum()), "mkt": rr.mean(), "top12": rr[top12].mean(),
+                         "bot12": rr[bot12].mean(), "top6": rr[top6].mean(), "set12": set(top12), "set6": set(top6)})
+        if len(rows) < 12:
+            h["analysis"] = f"Monthly momentum: only {len(rows)} months testable (needs 12 months of history first)."
+            return
+        a = pd.DataFrame(rows)
+        for k in ("12", "6"):                                                # turnover -> cost each month
+            prev, tc = None, []
+            for st_ in a[f"set{k}"]:
+                tc.append(1.0 if prev is None else len(st_ - prev) / MOM_TOP)
+                prev = st_
+            a[f"to{k}"] = tc
+        a["net12"] = a.top12 - a.to12 * MOM_COST
+        a["net6"] = a.top6 - a.to6 * MOM_COST
+        a["ls"] = a.top12 - a.bot12 - 2 * a.to12 * MOM_COST
+        a["yr"] = a.month.str[:4]
+        tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x)) + 1e-9) if len(x) > 2 else 0.0
+
+        def grow(x):
+            eq = (1 + x / 1e4).cumprod()
+            yrs = len(x) / 12
+            return (eq.iloc[-1] ** (1 / yrs) - 1) * 100, ((eq / eq.cummax()) - 1).min() * 100
+
+        def line(name, col):
+            ex = a[col] - a.mkt
+            cg, dd = grow(a[col])
+            return (f"  {name}: {a[col].mean():+.0f} bp a month ({cg:+.1f}% a year), beat the market by {ex.mean():+.0f} bp a month, "
+                    f"t-stat {tt(ex):+.2f}, beat it in {(ex > 0).mean() * 100:.0f}% of months, worst fall {dd:.0f}%")
+        mg, mdd = grow(a.mkt)
+        ex12 = a.net12 - a.mkt
+        yr_ex = ex12.groupby(a.yr).mean()
+        yr_n = a.groupby("yr").size()
+        full = yr_ex[yr_n >= 10]                                             # years with at least 10 tested months
+        out = ["MONTHLY MOMENTUM (F&O stocks, fixed rules set before testing)",
+               f"  Rank by the return from 12 months ago to 1 month ago; buy the top {MOM_TOP} equally at the next trading day's 09:20 "
+               "price; hold one month; repeat.",
+               f"  {len(a)} months tested ({a.month.iloc[0]} to {a.month.iloc[-1]}), about {a.n.mean():.0f} stocks ranked each month.",
+               f"  Costs: {MOM_COST:.0f} bp for each 100% of the portfolio replaced; average replaced per month: "
+               f"{a.to12.iloc[1:].mean() * 100:.0f}% (12-1), {a.to6.iloc[1:].mean() * 100:.0f}% (6-month).",
+               "",
+               f"  Market (all F&O stocks equally, no costs): {a.mkt.mean():+.0f} bp a month ({mg:+.1f}% a year), worst fall {mdd:.0f}%",
+               line("MAIN  12-1 momentum, top 20, after costs", "net12"),
+               line("      6-month momentum, top 20, after costs", "net6"),
+               f"  Long-short check (buy top 20, sell bottom 20, after costs): {a.ls.mean():+.0f} bp a month, t-stat {tt(a.ls):+.2f}",
+               "",
+               "  MAIN by year (gain over the market per month, after costs):  "
+               + "  ".join(f"{y}: {v:+.0f} bp (n={int((a.yr == y).sum())})" for y, v in yr_ex.items()),
+               (f"  best 3 months make {np.sort(ex12.to_numpy())[::-1][:3].sum() / ex12.sum() * 100:.0f}% of the total gain over the market"
+                if ex12.sum() > 0 else "  no total gain over the market"),
+               "",
+               "  Last 6 months (MAIN, gain over market): " + "  ".join(f"{m}: {v:+.0f}" for m, v in zip(a.month.iloc[-6:], ex12.iloc[-6:])),
+               "",
+               "  PASS RULE (set in advance): MAIN beats the market after costs on average, t-stat above 2, and beats it in at least "
+               "3 of the full years (10+ months tested).",
+               "  Verdict: " + ("PASSES - worth a forward paper test (one list a month)." if ex12.mean() > 0 and tt(ex12) > 2
+                                 and (full > 0).sum() >= min(3, len(full)) else "DOES NOT PASS."),
+               "",
+               "  Caution: today's F&O list only (stocks that did well were added to F&O, which flatters momentum and the market "
+               "line alike). Prices: 5-min history, entry and exit at 09:20. Research only, not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Monthly momentum failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
 def donchian_intraday_job():
     """5-min Donchian breakout per stock: close above the highest high of the previous 20 candles = BUY (below the lowest
     low = SELL), first signal per stock per day between 09:45 and 14:45, enter at that close; exit when a close crosses the
@@ -1202,7 +1327,7 @@ def settings_tab():
                 st.info(f"{'Saved' if ok else 'Not saved'}: {live_state()['note']}")
             except Exception as e:
                 st.error(f"Failed: {e}")
-    with st.expander("Research: Donchian channel backtests (run after 15:45 or at the weekend)"):
+    with st.expander("Research backtests (run after 15:45 or at the weekend)"):
         st.caption(f"Classic Donchian/turtle rules, fixed in advance: {DC_N}-candle breakout, {DC_EXIT}-candle opposite-channel exit. "
                    "Uses the stored 5 years. Takes a few minutes; the live alerts keep running.")
         _hs.setdefault("an_running", False)
@@ -1213,6 +1338,9 @@ def settings_tab():
         if r2.button("Run weekly Donchian", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=donchian_weekly_job, daemon=True).start()
+        if st.button("Run monthly momentum (12-1, top 20)", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=momentum_job, daemon=True).start()
         if _hs.get("analysis"):
             st.code(_hs["analysis"], language=None)
             if _hs["an_running"]:
