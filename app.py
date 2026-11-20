@@ -244,7 +244,7 @@ MOM_TOP = 20             # stocks held
 MOM_COST = 25.0          # bp per 100% of the portfolio replaced (delivery: STT 0.1% x2, stamp, exchange, GST, DP)
 
 
-def _daily_panel(progress=None):
+def _daily_panel(progress=None, since="0000"):
     """Daily 09:20 price and 15:25 close of every stock (days x stocks) from the stored 5-min history."""
     with LOCK:
         c = db()
@@ -256,7 +256,7 @@ def _daily_panel(progress=None):
             progress(f"Monthly momentum: loading {n_ + 1}/{len(syms)}")
         with LOCK:
             c = db()
-            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? AND day>=? ORDER BY day", (sy, since)).fetchall()
             c.close()
         o_, c_ = {}, {}
         for d, b in rows:
@@ -266,7 +266,7 @@ def _daily_panel(progress=None):
                 o_[d], c_[d] = float(v[0]), float(v[-1])
         op[sy], cl[sy] = pd.Series(o_), pd.Series(c_)
     O, C = pd.DataFrame(op).sort_index(), pd.DataFrame(cl).sort_index()
-    good = C.notna().sum(1) >= 0.5 * C.shape[1]          # drop thin days (holidays / partial downloads)
+    good = C.notna().sum(axis=1) >= 0.5 * C.shape[1]          # drop thin days (holidays / partial downloads)
     return O[good], C[good]
 
 
@@ -362,6 +362,140 @@ def momentum_job():
     finally:
         h["an_running"] = False
         gc.collect()
+
+
+# ======================= Monthly momentum: forward paper list =======================
+def mom_db():
+    with LOCK:
+        c = db()
+        c.execute("""CREATE TABLE IF NOT EXISTS mompaper(mon_day TEXT, sym TEXT, rnk INTEGER, score REAL, ref REAL,
+                     entry_day TEXT, entry REAL, exit_day TEXT, exit REAL, bp REAL, note TEXT, PRIMARY KEY(mon_day, sym))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS momstat(mon_day TEXT PRIMARY KEY, entry_day TEXT, exit_day TEXT, n INTEGER,
+                     mkt_bp REAL, list_bp REAL)""")
+        c.commit()
+        c.close()
+
+
+def mom_rank(upto=None):
+    """12-1 momentum ranking on the latest stored day (or `upto`). Returns (day, Series of scores, Series of closes)."""
+    since = (datetime.now(IST) - timedelta(days=430)).strftime("%Y-%m-%d")
+    O, C = _daily_panel(since=since)
+    if upto:
+        C = C[C.index <= upto]
+    if len(C) < 253:
+        raise RuntimeError(f"only {len(C)} trading days stored in the last 14 months (need 253)")
+    t = len(C) - 1
+    sc = (C.iloc[t - 21] / C.iloc[t - 252] - 1).dropna()
+    sc = sc[C.iloc[t].reindex(sc.index).notna()]                       # must have today's close
+    return str(C.index[t]), sc.sort_values(ascending=False), C.iloc[t]
+
+
+def _first_px(day):
+    """09:20 price (first 5-min close) of every stock on one day, from the stored history."""
+    with LOCK:
+        c = db()
+        rows = c.execute("SELECT sym, b FROM fnod WHERE day=?", (day,)).fetchall()
+        c.close()
+    out = {}
+    for sy, b in rows:
+        a = np.frombuffer(b, np.float32)
+        v = a[np.isfinite(a) & (a > 0)]
+        if len(v) >= 30:
+            out[sy] = float(v[0])
+    return out
+
+
+def mom_make_list(day=None, note=""):
+    """Rank and save the top 20; send them on Telegram."""
+    mom_db()
+    d0, sc, cl = mom_rank(day)
+    top = sc.head(MOM_TOP)
+    with LOCK:
+        c = db()
+        for k, (sy, v) in enumerate(top.items(), 1):
+            c.execute("INSERT OR IGNORE INTO mompaper(mon_day, sym, rnk, score, ref, note) VALUES(?,?,?,?,?,?)",
+                      (d0, sy, k, float(v), float(cl[sy]), note))
+        c.commit()
+        c.close()
+    lines = "\n".join(f"{k}. {sy} ({v * 100:+.0f}% over 12-1 months)" for k, (sy, v) in enumerate(top.items(), 1))
+    send_telegram(f"MONTHLY MOMENTUM PAPER LIST (data of {d0}, {len(sc)} stocks ranked){' - ' + note if note else ''}\n{lines}\n"
+                  "Buy equally at the next trading day 09:20, hold until the first trading day of next month 09:20. "
+                  "Paper only. Research, not advice.")
+    return d0
+
+
+def mom_step(now):
+    """Run once a day after the history top-up (15:50+): record entries/exits from today's stored 09:20 prices,
+    and on the last trading day of the month make the next list."""
+    mom_db()
+    ls = live_state()
+    d_s = now.strftime("%Y-%m-%d")
+    px = _first_px(d_s)
+    if len(px) < 0.5 * MOM_MIN:
+        ls["note"] = f"monthly list: today's prices not stored yet ({len(px)} stocks)"
+        return False
+    with LOCK:
+        c = db()
+        ent = c.execute("SELECT mon_day, sym FROM mompaper WHERE entry IS NULL AND mon_day < ?", (d_s,)).fetchall()
+        opn = c.execute("SELECT mon_day, sym, entry, entry_day FROM mompaper WHERE entry IS NOT NULL AND exit IS NULL "
+                        "AND substr(entry_day,1,7) < ?", (d_s[:7],)).fetchall()
+        c.close()
+    done = {}
+    with LOCK:                                                           # exits first: first trading day of a new month
+        c = db()
+        for md, sy, e, ed in opn:
+            if sy in px:
+                bp = (px[sy] / e - 1) * 1e4
+                c.execute("UPDATE mompaper SET exit_day=?, exit=?, bp=? WHERE mon_day=? AND sym=?", (d_s, px[sy], bp, md, sy))
+                done.setdefault((md, ed), []).append(bp)
+        for md, sy in ent:                                               # then the new list's entries
+            if sy in px:
+                c.execute("UPDATE mompaper SET entry_day=?, entry=? WHERE mon_day=? AND sym=?", (d_s, px[sy], md, sy))
+        c.commit()
+        c.close()
+    for (md, ed), bps in done.items():                                   # month result vs the market
+        e_px = _first_px(ed)
+        mk = [(px[s_] / e_px[s_] - 1) * 1e4 for s_ in e_px if s_ in px]
+        mkt = float(np.mean(np.clip(mk, -5000, 5000))) if mk else float("nan")
+        lb = float(np.mean(bps))
+        with LOCK:
+            c = db()
+            c.execute("INSERT OR REPLACE INTO momstat VALUES(?,?,?,?,?,?)", (md, ed, d_s, len(bps), mkt, lb))
+            c.commit()
+            c.close()
+        send_telegram(f"MONTHLY MOMENTUM RESULT (list of {md}, {ed} to {d_s}): top 20 {lb:+.0f} bp, all F&O stocks {mkt:+.0f} bp, "
+                      f"difference {lb - mkt:+.0f} bp (before costs; about 25 bp x share replaced). Research, not advice.")
+    # make the next list: on the last trading day of the month, or (fallback) the first day of a month that has none
+    with LOCK:
+        c = db()
+        have = {r[0][:7] for r in c.execute("SELECT DISTINCT mon_day FROM mompaper")}
+        c.close()
+    nxt = now + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    if nxt.month != now.month and d_s[:7] not in have:
+        mom_make_list()
+        ls["note"] = f"monthly list made for {d_s}"
+    else:
+        prev = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        if prev not in have and have and d_s[8:] <= "07":                 # missed month-end (holiday): make it now, late
+            with LOCK:
+                c = db()
+                last_prev = c.execute("SELECT MAX(day) FROM fnod WHERE day < ?", (d_s[:7] + "-01",)).fetchone()[0]
+                c.close()
+            if last_prev:
+                md = mom_make_list(last_prev, note="late: made after the month-end close, entry at today's 09:20")
+                with LOCK:
+                    c = db()
+                    for (sy,) in c.execute("SELECT sym FROM mompaper WHERE mon_day=? AND entry IS NULL", (md,)).fetchall():
+                        if sy in px:
+                            c.execute("UPDATE mompaper SET entry_day=?, entry=? WHERE mon_day=? AND sym=?", (d_s, px[sy], md, sy))
+                    c.commit()
+                    c.close()
+    return True
+
+
+MOM_MIN = 150            # stocks that must have today's prices before the monthly step runs
 
 
 def donchian_intraday_job():
@@ -926,6 +1060,15 @@ def live_loop():
                 if mnow >= 15 * 60 + 45 and ls["hist"] != d_s and CID and TOKEN:
                     ls["hist"] = d_s
                     fno_job(5)
+                if (mnow >= 15 * 60 + 50 and ls["hist"] == d_s and ls.get("mom") != d_s
+                        and mnow - ls.get("mom_t", -99) >= 10 and mnow < 20 * 60):     # monthly momentum list
+                    ls["mom_t"] = mnow
+                    try:
+                        if mom_step(now):
+                            ls["mom"] = d_s
+                    except Exception as e:
+                        ls["note"] = f"monthly list error: {str(e)[:120]}"
+                        ls["mom"] = d_s
                 if (9 * 60 + 25 <= mnow < 11 * 60 and CID and TOKEN and ls.get("swing_e_day") != d_s
                         and mnow - ls.get("swing_e", -99) >= 5):                    # weekly list: record entry prices
                     ls["swing_e"] = mnow
@@ -964,6 +1107,7 @@ def _tables_ready():
     """Once per server start: make sure both paper tables have the 'tag' column, and tag rows made before tagging existed."""
     paper_db()
     swing_db()
+    mom_db()
     try:
         backfill_tags()
     except Exception:
@@ -1110,6 +1254,7 @@ def _version():
             a = c.execute("SELECT COUNT(*), COUNT(bp) FROM fnopaper").fetchone()
             try:
                 b = c.execute("SELECT COUNT(*), COUNT(entry), COUNT(bp) FROM swingpaper").fetchone()
+                b = b + c.execute("SELECT COUNT(*), COUNT(entry), COUNT(bp) FROM mompaper").fetchone()
             except Exception:
                 b = ()
             c.close()
@@ -1132,7 +1277,7 @@ def auto_refresh():
 
 
 auto_refresh()
-tab1, tab2, tab3 = st.tabs(["Intraday alerts", "Weekly swing list", "Settings & data"])
+tab1, tab2, tab4, tab3 = st.tabs(["Intraday alerts", "Weekly swing list", "Monthly momentum", "Settings & data"])
 
 
 @st.fragment
@@ -1280,6 +1425,52 @@ def swing_tab():
         st.download_button("Download all weekly paper trades (CSV)", t.to_csv(index=False), "weekly_paper.csv", "text/csv")
 
 
+@st.fragment
+def momentum_tab():
+    st.caption(f"Last trading day of each month after 15:50: rank all F&O stocks by their return from 12 months ago to 1 month ago "
+               f"and list the top {MOM_TOP}. Entry next trading day 09:20 (equal amounts), exit the first trading day of the next "
+               "month 09:20. Compared with holding all F&O stocks equally. Backtest: +141 bp a month over the market after costs, "
+               "t-stat 2.5 (2023-2026). Judge after about 6 months. Paper only.")
+    mom_db()
+    t = read_table("SELECT * FROM mompaper ORDER BY mon_day DESC, rnk")
+    stt = read_table("SELECT * FROM momstat ORDER BY mon_day DESC")
+    if t.empty:
+        st.info("No monthly list yet. The first one is made on the last trading day of the month after 15:50 "
+                "(Settings & data has a preview of today's ranking).")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Finished months", f"{len(stt)}")
+    c2.metric("Top 20, average month", f"{stt.list_bp.mean():+.0f} bp" if len(stt) else "-")
+    c3.metric("All F&O stocks", f"{stt.mkt_bp.mean():+.0f} bp" if len(stt) else "-")
+    c4.metric("Difference", f"{(stt.list_bp - stt.mkt_bp).mean():+.0f} bp" if len(stt) else "-")
+    mons = list(dict.fromkeys(t.mon_day))
+    msel = st.selectbox("List decided on", mons, index=0, key="m_mon")
+    w = t[t.mon_day == msel]
+    sm = sectors_cached()
+    show = pd.DataFrame({"#": w.rnk, "Stock": w.sym, "Sector": w.sym.map(sm).fillna(""), "12-1 return": txt(w.score * 100, "{:+.0f}%"),
+                         "Entry": txt(w.entry, "{:,.2f}"), "Exit": txt(w.exit, "{:,.2f}"), "Result (bp)": txt(w.bp, "{:+.0f}")})
+    st.dataframe(show.style.map(_color_bp, subset=["Result (bp)"]), hide_index=True, use_container_width=True)
+    nt = w.note.dropna()
+    if len(nt) and nt.iloc[0]:
+        st.caption(f"Note: {nt.iloc[0]}")
+    s_ = stt[stt.mon_day == msel]
+    if len(s_):
+        r = s_.iloc[0]
+        st.caption(f"{r.entry_day} to {r.exit_day}: top 20 {r.list_bp:+.0f} bp, all F&O stocks {r.mkt_bp:+.0f} bp, "
+                   f"difference {r.list_bp - r.mkt_bp:+.0f} bp (before costs)")
+    elif w.entry.notna().any():
+        st.caption(f"Open since {w.entry_day.dropna().iloc[0]}; exits at the first trading day of next month 09:20.")
+    else:
+        st.caption("Waiting for entry at the next trading day 09:20 (recorded after 15:50 that day).")
+    with st.expander("History by month"):
+        if len(stt):
+            g = pd.DataFrame({"List of": stt.mon_day, "From": stt.entry_day, "To": stt.exit_day, "Top 20 (bp)": stt.list_bp,
+                              "Market (bp)": stt.mkt_bp, "Difference (bp)": stt.list_bp - stt.mkt_bp})
+            st.dataframe(g.style.format({"Top 20 (bp)": "{:+.0f}", "Market (bp)": "{:+.0f}", "Difference (bp)": "{:+.0f}"})
+                         .map(_color_bp, subset=["Difference (bp)"]), hide_index=True, use_container_width=True)
+        st.download_button("Download all monthly paper trades (CSV)", t.to_csv(index=False), "monthly_momentum_paper.csv", "text/csv")
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def data_check():
     with LOCK:
@@ -1338,6 +1529,13 @@ def settings_tab():
         if r2.button("Run weekly Donchian", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=donchian_weekly_job, daemon=True).start()
+        if st.button("Preview today's momentum top 20 (not saved)", use_container_width=True):
+            try:
+                d0, sc, _ = mom_rank()
+                st.code(f"Ranking on data of {d0} ({len(sc)} stocks):\n" + "\n".join(
+                    f"{k:>2}. {sy:<12} {v * 100:+.0f}%" for k, (sy, v) in enumerate(sc.head(MOM_TOP).items(), 1)), language=None)
+            except Exception as e:
+                st.error(f"Preview failed: {e}")
         if st.button("Run monthly momentum (12-1, top 20)", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=momentum_job, daemon=True).start()
@@ -1358,6 +1556,8 @@ with tab1:
     intraday_tab()
 with tab2:
     swing_tab()
+with tab4:
+    momentum_tab()
 with tab3:
     settings_tab()
 
