@@ -498,6 +498,229 @@ def mom_step(now):
 MOM_MIN = 150            # stocks that must have today's prices before the monthly step runs
 
 
+# ======================= Research: big-move continuation (swing) =======================
+BM_SIG, BM_VOL, BM_HOLD, BM_HOLD2, BM_COST = 3.0, 2.0, 10, 20, 20.0
+
+
+def _stock_dov(sy):
+    """Daily 09:20 price, close and total volume of one stock (only days that also have volume)."""
+    with LOCK:
+        c = db()
+        rows = c.execute("SELECT d.day, d.b, v.b FROM fnod d JOIN fnov v ON v.sym = d.sym AND v.day = d.day "
+                         "WHERE d.sym=? ORDER BY d.day", (sy,)).fetchall()
+        c.close()
+    days, O, D, V = [], [], [], []
+    for d_, b, vb in rows:
+        a = np.frombuffer(b, np.float32)
+        ok = a[np.isfinite(a) & (a > 0)]
+        vv = np.frombuffer(vb, np.float32).reshape(3, 75)[2]
+        if len(ok) < 60:
+            continue
+        days.append(d_)
+        O.append(float(ok[0]))
+        D.append(float(ok[-1]))
+        V.append(float(np.nansum(vv)))
+    return np.array(days), np.array(O), np.array(D), np.array(V)
+
+
+def bigmove_job():
+    """Buy after an unusually big UP day on heavy volume, sell after a big DOWN day; enter next morning 09:20,
+    exit at the close of the 10th trading day (20th as a second line). One open trade per stock."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Big-move continuation: starting...")
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnov GROUP BY sym HAVING COUNT(*) >= 250 ORDER BY sym")]
+            c.close()
+        rec, allf = [], []
+        for n_, sy in enumerate(syms):
+            if n_ % 10 == 0:
+                h["analysis"] = f"Big-move continuation: stock {n_ + 1}/{len(syms)}"
+            days, O, D, V = _stock_dov(sy)
+            n = len(days)
+            if n < 60:
+                continue
+            dd = days.astype("datetime64[D]")
+            r = np.full(n, np.nan)
+            r[1:] = D[1:] / D[:-1] - 1
+            gap_ok = np.zeros(n, bool)
+            gap_ok[1:] = (dd[1:] - dd[:-1]).astype(int) <= 5                      # yesterday really was the previous day
+            sd = _roll(np.nan_to_num(r), 20, np.std)
+            vm = _roll(V, 20, np.median)
+            f1, f2 = np.full(n, np.nan), np.full(n, np.nan)
+            f1[:n - BM_HOLD] = D[BM_HOLD:] / O[1:n - BM_HOLD + 1] - 1
+            f2[:n - BM_HOLD2] = D[BM_HOLD2:] / O[1:n - BM_HOLD2 + 1] - 1
+            sp1, sp2 = np.full(n, 99), np.full(n, 99)
+            sp1[:n - BM_HOLD] = (dd[BM_HOLD:] - dd[:n - BM_HOLD]).astype(int)
+            sp2[:n - BM_HOLD2] = (dd[BM_HOLD2:] - dd[:n - BM_HOLD2]).astype(int)
+            f1[sp1 > 20], f2[sp2 > 36] = np.nan, np.nan                           # skip windows with missing data
+            allf.append(pd.DataFrame({"day": days, "f1": f1 * 1e4, "f2": f2 * 1e4}))
+            t = 21
+            while t < n - 1:
+                big = (gap_ok[t] and np.isfinite(r[t]) and sd[t] > 0 and abs(r[t]) > BM_SIG * sd[t]
+                       and vm[t] > 0 and V[t] > BM_VOL * vm[t] and np.isfinite(f1[t]))
+                if not big:
+                    t += 1
+                    continue
+                side = 1 if r[t] > 0 else -1
+                rec.append((days[t], sy, side, r[t] * 1e4, r[t] / sd[t], V[t] / vm[t], f1[t] * 1e4, f2[t] * 1e4))
+                t += BM_HOLD                                                      # one open trade per stock
+        a = pd.DataFrame(rec, columns=["day", "sym", "side", "move", "sigmas", "volx", "raw1", "raw2"])
+        if a.empty:
+            h["analysis"] = "Big-move continuation: no events found (is the volume history downloaded?)"
+            return
+        mk = pd.concat(allf).groupby("day")[["f1", "f2"]].mean()
+        a["ex1"] = a.side * (a.raw1 - a.day.map(mk.f1))
+        a["ex2"] = a.side * (a.raw2 - a.day.map(mk.f2))
+        a["p1"] = a.side * a.raw1
+        a["yr"] = a.day.str[:4]
+        a["wk"] = pd.to_datetime(a.day).dt.strftime("%G-%V")
+        tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x)) + 1e-9) if len(x) > 2 else 0.0
+        g1 = (a.ex1 - BM_COST).groupby(a.wk).mean()
+        yrs = a.groupby("yr").ex1.agg(["mean", "size"])
+        full = yrs[yrs["size"] >= 50]
+        up, dn = a[a.side > 0], a[a.side < 0]
+        a2 = a[a.ex2.notna()]
+        ok = (a.ex1.mean() - BM_COST > 0 and tt(g1) > 3 and (full["mean"] - BM_COST > 0).all())
+        out = ["BIG-MOVE CONTINUATION (F&O stocks, daily, fixed rules set before testing)",
+               f"  Event: daily move above {BM_SIG:g}x the stock's normal daily move (std of the last 20 days) on volume above "
+               f"{BM_VOL:g}x its 20-day median. BUY after an up move, SELL after a down move; enter next morning 09:20; "
+               f"exit at the close of the {BM_HOLD}th trading day. One open trade per stock.",
+               f"  {len(a):,} trades on {a.sym.nunique()} stocks ({len(up):,} up, {len(dn):,} down), {a.day.min()} to {a.day.max()}",
+               f"  typical event: move {a.move.abs().median():.0f} bp ({a.sigmas.abs().median():.1f}x normal), volume {a.volx.median():.1f}x",
+               "",
+               f"  MAIN (10 days): gain over the market per trade {a.ex1.mean():+.1f} bp (raw {a.p1.mean():+.1f} bp), "
+               f"right {(a.ex1 > 0).mean() * 100:.0f}%, median {a.ex1.median():+.1f} bp",
+               f"  after {BM_COST:.0f} bp cost: {a.ex1.mean() - BM_COST:+.1f} bp per trade;  per WEEK of events: t-stat {tt(g1):+.2f}, "
+               f"positive {(g1 > 0).mean() * 100:.0f}% of {len(g1)} weeks",
+               f"  UP moves (buy): {up.ex1.mean():+.1f} bp   DOWN moves (sell): {dn.ex1.mean():+.1f} bp",
+               "  by year: " + "  ".join(f"{y}: {m:+.1f} bp (n={int(n)})" for y, (m, n) in yrs.iterrows()),
+               f"  20 days instead: {a2.ex2.mean():+.1f} bp over the market (up {a2[a2.side > 0].ex2.mean():+.1f}, "
+               f"down {a2[a2.side < 0].ex2.mean():+.1f})",
+               f"  bigger events only (above 5x normal): {a[a.sigmas.abs() > 5].ex1.mean():+.1f} bp (n={int((a.sigmas.abs() > 5).sum())})",
+               "",
+               f"  PASS RULE (set in advance): 10-day gain over the market above the {BM_COST:.0f} bp cost, weekly t-stat above 3, "
+               "and above the cost in every year with 50+ trades.",
+               "  Verdict: " + ("PASSES - worth a forward paper test." if ok else "DOES NOT PASS."),
+               "",
+               "  Caution: today's F&O list only; shorting a down-move needs stock futures (lot sizes, margin). Research, not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Big-move continuation failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
+# ======================= Research: NIFTY last-half-hour momentum (intraday) =======================
+NX_COST = 7.0            # bp, NIFTY futures round trip (Zerodha charges ~6 bp at 1 lot + slippage)
+
+
+def nifty_download(h):
+    """NIFTY 50 index 5-min closes for ~5 years into table idxd (same 75-bar format as the stocks). Skips stored days."""
+    with LOCK:
+        c = db()
+        c.execute("CREATE TABLE IF NOT EXISTS idxd(sym TEXT, day TEXT, b BLOB, PRIMARY KEY(sym, day))")
+        have = {r[0] for r in c.execute("SELECT day FROM idxd WHERE sym='NIFTY'")}
+        c.commit()
+        c.close()
+    today = datetime.now(IST).date()
+    a0, wins = today - timedelta(days=1830), []
+    while a0 <= today:
+        wins.append((a0, min(a0 + timedelta(days=85), today + timedelta(days=1))))
+        a0 += timedelta(days=85)
+    for n_, (a, b) in enumerate(wins):
+        wd = [x for x in (a + timedelta(days=k) for k in range((b - a).days)) if x.weekday() < 5 and x < today]
+        if wd and sum(x.strftime("%Y-%m-%d") in have for x in wd) >= 0.6 * len(wd):
+            continue
+        h["analysis"] = f"NIFTY last half hour: downloading NIFTY 5-min history {n_ + 1}/{len(wins)}"
+        body = {"securityId": "13", "exchangeSegment": "IDX_I", "instrument": "INDEX", "interval": "5", "oi": False,
+                "fromDate": a.strftime("%Y-%m-%d"), "toDate": b.strftime("%Y-%m-%d")}
+        j = hist_post(body, path="/charts/intraday")
+        j = j.get("data") or j
+        ts, cl = j.get("timestamp") or [], j.get("close") or []
+        if not ts:
+            continue
+        off = 315532800 if datetime.fromtimestamp(ts[0], IST).year < 2020 else 0
+        dd = {}
+        for t_, v_ in zip(ts, cl):
+            x = datetime.fromtimestamp(t_ + off, IST)
+            k = (x.hour * 60 + x.minute - 555) // 5
+            if x.weekday() < 5 and 0 <= k < 75 and v_:
+                dd.setdefault(f"{x:%Y-%m-%d}", np.full(75, np.nan, np.float32))[k] = v_
+        rows = [("NIFTY", k_, v_.tobytes()) for k_, v_ in dd.items() if np.isfinite(v_).sum() >= 70]
+        with LOCK:
+            c = db()
+            c.executemany("INSERT OR REPLACE INTO idxd VALUES(?,?,?)", rows)
+            c.commit()
+            c.close()
+        time.sleep(0.4)
+
+
+def nifty_lasthalf_job():
+    """Direction of the move from yesterday's close to 09:45 -> take that direction from 15:00 to 15:30."""
+    h = hist_state()
+    h.update(an_running=True, analysis="NIFTY last half hour: starting...")
+    try:
+        if CID and TOKEN:
+            nifty_download(h)
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM idxd WHERE sym='NIFTY' ORDER BY day").fetchall()
+            c.close()
+        if len(rows) < 250:
+            h["analysis"] = f"NIFTY last half hour: only {len(rows)} days of NIFTY history stored (download failed?)"
+            return
+        days = np.array([r[0] for r in rows])
+        C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+        C = pd.DataFrame(C).ffill(axis=1).bfill(axis=1).to_numpy()
+        dd = days.astype("datetime64[D]")
+        prev_ok = np.r_[False, (dd[1:] - dd[:-1]).astype(int) <= 5]
+        r1 = np.full(len(C), np.nan)
+        r1[1:] = C[1:, 5] / C[:-1, 74] - 1                                       # yesterday's close -> 09:45
+        r1[~prev_ok] = np.nan
+        r12 = C[:, 68] / C[:, 62] - 1                                            # 14:30 -> 15:00
+        rl = C[:, 74] / C[:, 68] - 1                                             # 15:00 -> 15:30 (the trade)
+        side = np.sign(r1)
+        a = pd.DataFrame({"day": days, "r1": r1 * 1e4, "r12": r12 * 1e4, "rl": rl * 1e4, "side": side,
+                          "pts": side * (C[:, 74] - C[:, 68])})
+        a = a[np.isfinite(a.r1) & (a.side != 0)].copy()
+        a["pnl"] = a.side * a.rl
+        a["yr"] = a.day.str[:4]
+        q = a.r1.abs().rolling(250, min_periods=120).quantile(0.75).shift(1)    # only past days: no look-ahead
+        big = a[a.r1.abs() > q]
+        agree = a[np.sign(a.r12) == a.side]
+        tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x)) + 1e-9) if len(x) > 2 else 0.0
+        yrs = a.groupby("yr").pnl.agg(["mean", "size"])
+        full = yrs[yrs["size"] >= 150]
+
+        def line(nm, x):
+            return (f"  {nm}: {len(x)} days, {x.pnl.mean():+.2f} bp ({x.pts.mean():+.1f} NIFTY points) per day, right "
+                    f"{(x.pnl > 0).mean() * 100:.0f}%, t-stat {tt(x.pnl):+.2f}; after {NX_COST:g} bp cost {x.pnl.mean() - NX_COST:+.2f} bp")
+        ok = a.pnl.mean() - NX_COST > 0 and tt(a.pnl) > 3 and (full["mean"] - NX_COST > 0).all()
+        out = ["NIFTY LAST-HALF-HOUR MOMENTUM (index 5-min, fixed rules set before testing)",
+               "  Direction of the move from yesterday's close to 09:45 -> BUY (up) or SELL (down) NIFTY futures at 15:00, exit 15:30.",
+               f"  {len(a)} days, {a.day.min()} to {a.day.max()}. Average size of the 15:00-15:30 move: {a.rl.abs().mean():.1f} bp.",
+               "",
+               line("MAIN, every day", a),
+               line("   14:30-15:00 moved the same way too", agree),
+               line("   big-morning days (top 25% move to 09:45)", big),
+               "  MAIN by year: " + "  ".join(f"{y}: {m:+.2f} bp (n={int(n)})" for y, (m, n) in yrs.iterrows()),
+               f"  correlation of the 09:45 move with the last half hour: {np.corrcoef(a.r1, a.rl)[0, 1]:+.3f}",
+               "",
+               f"  PASS RULE (set in advance): MAIN above the {NX_COST:g} bp cost, t-stat above 3, above the cost in every full year.",
+               "  Verdict: " + ("PASSES - worth a forward paper test." if ok else "DOES NOT PASS."),
+               "",
+               "  Index prices, not futures (futures add a small premium that does not change direction). Research, not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"NIFTY last half hour failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
 def donchian_intraday_job():
     """5-min Donchian breakout per stock: close above the highest high of the previous 20 candles = BUY (below the lowest
     low = SELL), first signal per stock per day between 09:45 and 14:45, enter at that close; exit when a close crosses the
@@ -1529,6 +1752,13 @@ def settings_tab():
         if r2.button("Run weekly Donchian", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=donchian_weekly_job, daemon=True).start()
+        b1, b2 = st.columns(2)
+        if b1.button("Run big-move continuation (swing)", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=bigmove_job, daemon=True).start()
+        if b2.button("Run NIFTY last half hour (intraday)", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=nifty_lasthalf_job, daemon=True).start()
         if st.button("Preview today's momentum top 20 (not saved)", use_container_width=True):
             try:
                 d0, sc, _ = mom_rank()
