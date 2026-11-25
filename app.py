@@ -43,7 +43,7 @@ def send_telegram(text):
 
 @st.cache_resource
 def hist_state():
-    return {"running": False, "done": 0, "total": 0, "msg": "", "rows": 0, "errs": [], "probe": []}
+    return {"running": False, "done": 0, "total": 0, "msg": "", "rows": 0, "errs": [], "probe": [], "an_running": False}
 
 
 def hist_post(body, nocid=False, path="/charts/rollingoption"):
@@ -1477,7 +1477,7 @@ def live_loop():
             ls["top20_asof"] = asof
             quiet = now.weekday() >= 5 or mnow >= 18 * 60 + 30 or mnow < 8 * 60
             if (quiet and (not asof or (now - datetime.strptime(asof, "%Y-%m-%d")).days >= 7)
-                    and not hist_state()["an_running"] and ls.get("top20_try") != d_s):
+                    and not hist_state().get("an_running") and ls.get("top20_try") != d_s):
                 ls["top20_try"] = d_s                                     # at most one attempt a day
                 top20_build()                                             # weekly, outside market hours
                 ls["top20_asof"], ls["top20"] = top20_load()
