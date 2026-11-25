@@ -64,6 +64,9 @@ threshold = st.sidebar.slider("Signal threshold", 10, 70, 30, 5)
 refresh = st.sidebar.selectbox("Auto refresh (seconds)", [0, 30, 60, 180], index=2)
 
 
+show_legend = st.sidebar.checkbox("Show chart legend", value=False)
+
+
 def chart(d, rep, intraday):
     v = d.tail(bars)
     fmt = "%d %b %H:%M" if intraday else "%d %b %y"
@@ -104,7 +107,7 @@ def chart(d, rep, intraday):
     for y in (45, 55):
         fig.add_hline(y=y, line=dict(width=0.7, dash="dash", color="#999999"), row=3, col=1)
     fig.update_xaxes(type="category", nticks=8, rangeslider_visible=False)
-    fig.update_layout(height=820, margin=dict(l=5, r=5, t=40, b=5),
+    fig.update_layout(height=720, margin=dict(l=5, r=5, t=40, b=5), showlegend=show_legend,
                       legend=dict(orientation="h", yanchor="top", y=-0.07, x=0),
                       hovermode="x unified")
     return fig
@@ -134,21 +137,18 @@ def view():
     m[2].metric("Score", f"{rep['score']:+.0f} / 100")
     st.caption(f"Latest candle starts {a.index[-1]:%d %b %Y %H:%M} IST. During market hours it is still forming.")
 
-    left, right = st.columns([2.4, 1])
-    with left:
-        st.plotly_chart(chart(d, rep if intraday else None, intraday), key="chart")
-    with right:
-        with st.container(border=True, height=520):
-            st.markdown(rep["text"])
-        st.markdown("**Backtest on loaded data**")
-        for name, r in rep["backtest"].items():
-            if r["signals"]:
-                st.write(f"{name}: right {r['hit']:.0%} of {r['signals']} signals "
-                         f"(any-candle baseline {r['base']:.0%}), average {r['avg']:+.2f} points")
-            else:
-                st.write(f"{name}: no signals")
-        st.caption("Signals overlap, costs are ignored. A hit rate near the baseline means no edge.")
-        st.dataframe(rep["factors"], hide_index=True)
+    st.plotly_chart(chart(d, rep if intraday else None, intraday), key="chart")
+    with st.container(border=True):
+        st.markdown(rep["text"])
+    st.markdown("**Backtest on loaded data**")
+    for name, r in rep["backtest"].items():
+        if r["signals"]:
+            st.write(f"{name}: right {r['hit']:.0%} of {r['signals']} signals "
+                     f"(any-candle baseline {r['base']:.0%}), average {r['avg']:+.2f} points")
+        else:
+            st.write(f"{name}: no signals")
+    st.caption("Signals overlap, costs are ignored. A hit rate near the baseline means no edge.")
+    st.dataframe(rep["factors"], hide_index=True)
 
     if st.checkbox("Show multi-timeframe bias"):
         cols = st.columns(4)
