@@ -721,6 +721,120 @@ def nifty_lasthalf_job():
         gc.collect()
 
 
+# ======================= Research: do the "best stocks" stay best? (intraday model) =======================
+PS_COST = 10.0           # bp round trip (intraday cash, as in the live review rule)
+PS_MIN_TR = 8            # a stock needs this many earlier out-of-sample trades to be ranked
+
+
+def persist_job():
+    """Walk-forward per stock (same model and 1.7x rule as the live alerts, refitted each year on earlier days only).
+    Then for each later year: rank stocks by their EARLIER out-of-sample results, pick the top 5/10/20,
+    and compare them with all other stocks in that year."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Best-stock test: starting...")
+    try:
+        with LOCK:
+            c = db()
+            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+            c.close()
+        rec = []
+        for n_, sy in enumerate(syms):
+            if n_ % 5 == 0:
+                h["analysis"] = f"Best-stock test: walk-forward on stock {n_ + 1}/{len(syms)} (takes a few minutes)"
+            with LOCK:
+                c = db()
+                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+                c.close()
+            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+            C = np.take_along_axis(C, np.maximum.accumulate(np.where(np.isnan(C), 0, np.arange(75)), axis=1), axis=1)
+            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+            C, days = C[ok], np.array([r[0] for r, o in zip(rows, ok) if o])
+            if len(C) < 450:
+                continue
+            X3, Y3, _ = fno_feats(C)
+            yrs = np.array([d[:4] for d in days])
+            for Y in sorted(set(yrs)):
+                tr, te = days < f"{Y}-01-01", yrs == Y
+                if tr.sum() < 250 or not te.any():
+                    continue
+                Xt = X3[tr].reshape(-1, 12)
+                mu, sd = Xt.mean(0), Xt.std(0) + 1e-9
+                A = (Xt - mu) / sd
+                yv = Y3[tr].reshape(-1)
+                w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(12), A.T @ (yv - yv.mean()))
+                thr = np.percentile(np.abs(A @ w), 90)
+                P = ((X3[te] - mu) / sd) @ w                                     # test days x 52 bars
+                R = np.abs(P) / thr
+                for di, d in zip(np.where(te)[0], days[te]):
+                    hit = np.where(R[di - np.where(te)[0][0]] >= SIG_MIN)[0]
+                    if len(hit):
+                        j = hit[0]
+                        rec.append((sy, d, Y, float(np.sign(P[di - np.where(te)[0][0], j]) * Y3[di, j])))
+                del A, Xt
+            del C, X3, Y3
+            if n_ % 20 == 0:
+                gc.collect()
+        a = pd.DataFrame(rec, columns=["sym", "day", "yr", "bp"])
+        a["net"] = a.bp - PS_COST
+        years = sorted(a.yr.unique())
+        if len(years) < 2:
+            h["analysis"] = "Best-stock test: not enough years of history"
+            return
+        tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x))) if len(x) > 2 and x.std() > 0 else 0.0
+        out = ["DO THE BEST STOCKS STAY BEST? (intraday price model, F&O stocks)",
+               f"  Same model and {SIG_MIN:g}x rule as the live alerts; each year traded by models trained only on earlier days.",
+               f"  {len(a):,} out-of-sample trades, {a.sym.nunique()} stocks, years {', '.join(years)}. Costs {PS_COST:g} bp per trade.",
+               "  All stocks by year (after cost): " + "  ".join(f"{y}: {g.net.mean():+.1f} bp, {(g.bp > 0).mean() * 100:.0f}% right "
+                                                            f"(n={len(g)})" for y, g in a.groupby("yr")),
+               "", "  PICK ON EARLIER YEARS -> JUDGE ON THE NEXT YEAR (per trade, after cost):"]
+        res = {N: [] for N in (5, 10, 20)}
+        cors = []
+        for i, Y in enumerate(years[1:], 1):
+            past = a[a.yr < Y].groupby("sym").agg(n=("net", "size"), m=("net", "mean"))
+            past = past[past.n >= PS_MIN_TR].sort_values("m", ascending=False)
+            cur = a[a.yr == Y]
+            cm = cur.groupby("sym").net.mean()
+            com = past.index.intersection(cm.index)
+            if len(com) > 10:
+                cors.append(pd.Series(past.m[com]).rank().corr(cm[com].rank()))
+            line = f"    {Y}:"
+            for N in (5, 10, 20):
+                top = list(past.index[:N])
+                tg, rg = cur[cur.sym.isin(top)], cur[~cur.sym.isin(top)]
+                res[N].append((Y, tg, rg))
+                line += f"  top {N}: {tg.net.mean():+.1f} bp (n={len(tg)}) vs rest {rg.net.mean():+.1f}" if len(tg) else f"  top {N}: no trades"
+            out.append(line)
+        out.append("")
+        verdict = {}
+        for N in (5, 10, 20):
+            tg = pd.concat([x[1] for x in res[N]])
+            rg = pd.concat([x[2] for x in res[N]])
+            diff_t = (tg.net.mean() - rg.net.mean()) / np.sqrt(tg.net.var() / len(tg) + rg.net.var() / len(rg)) if len(tg) > 2 else 0
+            yr_ok = all(len(x[1]) and x[1].net.mean() > 0 and x[1].net.mean() > x[2].net.mean() for x in res[N])
+            verdict[N] = tg.net.mean() > 0 and diff_t > 2.5 and yr_ok
+            out.append(f"  TOP {N} overall: {len(tg)} trades, {(tg.bp > 0).mean() * 100:.0f}% right, {tg.net.mean():+.1f} bp after cost "
+                       f"(t {tt(tg.net):+.2f}); rest {rg.net.mean():+.1f} bp; difference t-stat {diff_t:+.2f}; "
+                       f"{'better in every year' if yr_ok else 'NOT better in every year'}")
+        out += [f"  Rank correlation of a stock's earlier result with its next-year result: "
+                f"{np.mean(cors):+.3f} (0 = no persistence, 1 = perfect)" if cors else "",
+                "",
+                "  PASS RULE (set in advance): the picked group is above cost, beats the rest with t-stat above 2.5, "
+                "and is positive and better than the rest in every test year.",
+                "  Verdict: " + ("; ".join(f"top {N} {'PASSES' if v else 'does not pass'}" for N, v in verdict.items())),
+                ""]
+        allp = a.groupby("sym").agg(n=("net", "size"), m=("net", "mean"), w=("bp", lambda x: (x > 0).mean() * 100))
+        allp = allp[allp.n >= 15].sort_values("m", ascending=False).head(10)
+        out += ["  For information only - best 10 stocks over ALL years (picked with hindsight; NOT a trading list):",
+                "    " + ", ".join(f"{s_} {r.m:+.0f}bp/{r.w:.0f}% (n={int(r.n)})" for s_, r in allp.iterrows()),
+                "  Research only, not advice."]
+        h["analysis"] = "\n".join(x for x in out if x is not None)
+    except Exception as e:
+        h["analysis"] = f"Best-stock test failed: {e}"
+    finally:
+        h["an_running"] = False
+        gc.collect()
+
+
 def donchian_intraday_job():
     """5-min Donchian breakout per stock: close above the highest high of the previous 20 candles = BUY (below the lowest
     low = SELL), first signal per stock per day between 09:45 and 14:45, enter at that close; exit when a close crosses the
@@ -1752,6 +1866,9 @@ def settings_tab():
         if r2.button("Run weekly Donchian", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=donchian_weekly_job, daemon=True).start()
+        if st.button("Run 'best stocks stay best?' test (intraday model)", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=persist_job, daemon=True).start()
         b1, b2 = st.columns(2)
         if b1.button("Run big-move continuation (swing)", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
