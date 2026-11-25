@@ -14,6 +14,36 @@ def resample(df, minutes):
     return df.groupby(start).agg(AGG)
 
 
+def pivot_levels(high, low, close):
+    pivot = (high + low + close) / 3
+    bc = (high + low) / 2
+    tc = 2 * pivot - bc
+    return dict(pivot=pivot, cpr_low=np.minimum(bc, tc), cpr_high=np.maximum(bc, tc),
+                r1=2 * pivot - low, s1=2 * pivot - high)
+
+
+def session_closed(last_candle, now=None):
+    """True when the session of the latest candle has ended, so levels apply to the next session."""
+    now = now or pd.Timestamp.now(tz="Asia/Kolkata")
+    return last_candle.date() < now.date() or (now.hour, now.minute) >= (15, 30)
+
+
+def current_view(d, now=None):
+    """Copy of d for the live estimate. After the close, the last row gets next-session levels.
+    Historical rows are untouched. Needs at least two sessions."""
+    closed = session_closed(d.index[-1], now)
+    view = d.copy()
+    if closed:
+        s = d.groupby(d.index.date).agg(AGG)
+        a, b = s.iloc[-2], s.iloc[-1]
+        new = dict(pdh=b.high, pdl=b.low, pdc=b.close, pdh2=a.high, pdl2=a.low, pdc2=a.close,
+                   **pivot_levels(b.high, b.low, b.close))
+        for name, value in new.items():
+            view.loc[view.index[-1], name] = value
+        view["score"] = score(view)
+    return view, closed
+
+
 def add_features(df):
     d = df.copy()
     day = pd.Series(d.index.date, index=d.index)
@@ -36,11 +66,8 @@ def add_features(df):
     s = d.groupby(day).agg(AGG)
     lv = pd.DataFrame({"pdh": s.high.shift(1), "pdl": s.low.shift(1), "pdc": s.close.shift(1),
                        "pdc2": s.close.shift(2), "pdh2": s.high.shift(2), "pdl2": s.low.shift(2)})
-    lv["pivot"] = (lv.pdh + lv.pdl + lv.pdc) / 3
-    bc = (lv.pdh + lv.pdl) / 2
-    tc = 2 * lv["pivot"] - bc
-    lv["cpr_low"], lv["cpr_high"] = np.minimum(bc, tc), np.maximum(bc, tc)
-    lv["r1"], lv["s1"] = 2 * lv["pivot"] - lv.pdl, 2 * lv["pivot"] - lv.pdh
+    for name, value in pivot_levels(lv.pdh, lv.pdl, lv.pdc).items():
+        lv[name] = value
     for col in lv.columns:
         d[col] = day.map(lv[col])
 
@@ -110,14 +137,15 @@ def session_summary(g):
             f"the first-hour range.")
 
 
-def report(d, horizon=3, threshold=30):
+def report(d, horizon=3, threshold=30, now=None):
     """Commentary, scenarios and an illustrative projected path from the latest candle."""
-    last = d.iloc[-1]
+    view, closed = current_view(d, now)
+    last = view.iloc[-1]
     day = pd.Series(d.index.date, index=d.index)
     sessions = [g for _, g in d.groupby(day)]
     if len(sessions) < 3:
         raise ValueError("Need at least 3 sessions of intraday data.")
-    prev = sessions[-3:-1]
+    prev = sessions[-2:] if closed else sessions[-3:-1]
     c, atr, val = last.close, last.atr, float(last.score)
     bias = bias_of(val, threshold)
 
@@ -131,8 +159,13 @@ def report(d, horizon=3, threshold=30):
 
     where = ("above the previous high" if c > last.pdh else "below the previous low" if c < last.pdl
              else "inside the previous range")
-    lines += [f"#### Latest session {d.index[-1]:%d %b}", f"- {session_summary(sessions[-1])}",
-              f"- Last price **{c:,.2f}** is {where}, {'above' if c > last.vwap else 'below'} VWAP ({last.vwap:,.2f}).",
+    if closed:
+        lines += [f"#### Setup for the next session",
+                  f"- Levels below come from {d.index[-1]:%d %b}. VWAP, EMA, RSI and patterns are as of that close. "
+                  "An opening gap is not predicted."]
+    else:
+        lines += [f"#### Live session {d.index[-1]:%d %b}", f"- {session_summary(sessions[-1])}"]
+    lines += [f"- Last price **{c:,.2f}** is {where}, {'above' if c > last.vwap else 'below'} VWAP ({last.vwap:,.2f}).",
               f"- EMA9 {'>' if last.ema9 > last.ema20 else '<'} EMA20 · RSI {last.rsi:.0f} · ATR {atr:,.2f}.",
               f"- Levels: R1 {last.r1:,.2f} · CPR {last.cpr_low:,.2f}–{last.cpr_high:,.2f} · S1 {last.s1:,.2f} · "
               f"PDH {last.pdh:,.2f} · PDL {last.pdl:,.2f}."]
@@ -146,7 +179,7 @@ def report(d, horizon=3, threshold=30):
     sup = next((x for x in reversed(levels) if x < c - 0.25 * atr), c - atr)
     res2 = next((x for x in levels if x > res + 0.25 * atr), res + atr)
     sup2 = next((x for x in reversed(levels) if x < sup - 0.25 * atr), sup - atr)
-    lines += [f"#### Next move estimate (next {horizon} candles): **{bias}** (score {val:+.0f} of ±100)",
+    lines += [f"#### Next move estimate ({'first' if closed else 'next'} {horizon} candles): **{bias}** (score {val:+.0f} of ±100)",
               f"- Up case: candle close above {res:,.2f} → {res2:,.2f}; invalid below {sup:,.2f}.",
               f"- Down case: candle close below {sup:,.2f} → {sup2:,.2f}; invalid above {res:,.2f}.",
               f"- Range case: while between {sup:,.2f} and {res:,.2f}, no breakout is confirmed."]
@@ -158,7 +191,7 @@ def report(d, horizon=3, threshold=30):
         q = min(max(p + drift, sup), res)
         path.append((p, max(p, q) + atr * 0.35, min(p, q) - atr * 0.35, q))
         p = q
-    table = pd.DataFrame([(n, w, int(np.nan_to_num(np.asarray(v, dtype=float))[-1])) for n, (w, v) in factors(d).items()],
+    table = pd.DataFrame([(n, w, int(np.nan_to_num(np.asarray(v, dtype=float))[-1])) for n, (w, v) in factors(view).items()],
                          columns=["Factor", "Weight", "Signal"])
-    return dict(bias=bias, score=val, text="\n".join(lines), path=path, factors=table,
+    return dict(closed=closed, levels={k: float(last[k]) for k in ("pdh", "pdl", "pivot")}, bias=bias, score=val, text="\n".join(lines), path=path, factors=table,
                 support=sup, resistance=res, backtest=backtest(d, horizon, threshold))

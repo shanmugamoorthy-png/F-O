@@ -87,6 +87,11 @@ def chart(d, rep, intraday):
             fx = [f"+{i}" for i in range(1, len(c) + 1)]
             fig.add_trace(go.Candlestick(x=fx, open=o, high=h, low=l, close=c, name="Projection (illustrative)",
                                          opacity=0.4, increasing_line_color="#17a2b8", decreasing_line_color="#e67e22"), 1, 1)
+            if rep["closed"]:
+                for col, name, colour in (("pdh", "Next PDH", "#d0021b"), ("pdl", "Next PDL", "#2e9e44"),
+                                          ("pivot", "Next pivot", "#888888")):
+                    fig.add_trace(go.Scatter(x=[x[-1]] + fx, y=[rep["levels"][col]] * (len(fx) + 1), name=name,
+                                             mode="lines", line=dict(color=colour, width=2, dash="dash")), 1, 1)
             for y, colour in ((rep["resistance"], "#d0021b"), (rep["support"], "#2e9e44")):
                 fig.add_hline(y=y, line=dict(color=colour, width=1), annotation_text=f"{y:,.2f}", row=1, col=1)
     if v.volume.sum() > 0:
@@ -99,7 +104,8 @@ def chart(d, rep, intraday):
     for y in (45, 55):
         fig.add_hline(y=y, line=dict(width=0.7, dash="dash", color="#999999"), row=3, col=1)
     fig.update_xaxes(type="category", nticks=8, rangeslider_visible=False)
-    fig.update_layout(height=760, margin=dict(l=5, r=5, t=30, b=5), legend=dict(orientation="h", y=1.04),
+    fig.update_layout(height=820, margin=dict(l=5, r=5, t=40, b=5),
+                      legend=dict(orientation="h", yanchor="top", y=-0.07, x=0),
                       hovermode="x unified")
     return fig
 
@@ -148,7 +154,7 @@ def view():
         cols = st.columns(4)
         for col, other in zip(cols, ["5m", "15m", "30m", "1h"]):
             try:
-                s = float(an.add_features(load(label, other)).score.iloc[-1])
+                s = float(an.current_view(an.add_features(load(label, other)))[0].score.iloc[-1])
                 col.metric(other, an.bias_of(s, threshold), f"{s:+.0f}")
             except Exception as e:
                 col.error(str(e)[:100])
