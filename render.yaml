@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: fno-price-action-chart
+    runtime: python
+    plan: free
+    rootDir: chart-app
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: DHAN_CLIENT_ID
+        sync: false
+      - key: DHAN_ACCESS_TOKEN
+        sync: false
+      - key: APP_PASSWORD
+        sync: false

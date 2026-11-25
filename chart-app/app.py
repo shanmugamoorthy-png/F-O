@@ -1,0 +1,158 @@
+"""Index and F&O multi-timeframe candle chart with price action commentary (Dhan API)."""
+import hmac
+import os
+
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+import analysis as an
+import dhan
+
+st.set_page_config(page_title="F&O Price Action", layout="wide")
+
+# label: (Dhan source interval, resample minutes, calendar days to fetch)
+TF = {"1m": (1, None, 10), "3m": (1, 3, 20), "5m": (5, None, 45), "10m": (5, 10, 60),
+      "15m": (15, None, 90), "30m": (15, 30, 90), "75m": (15, 75, 90), "1h": (15, 60, 90), "Daily": (None, None, 730)}
+
+
+def secret(name):
+    return os.getenv(name, "").strip()
+
+
+password = secret("APP_PASSWORD")
+if not password:
+    st.error("Set APP_PASSWORD in Render. Without it anyone with the link could use your Dhan data.")
+    st.stop()
+if not hmac.compare_digest(st.sidebar.text_input("App password", type="password").encode(), password.encode()):
+    st.info("Enter the app password in the sidebar.")
+    st.stop()
+
+client_id = secret("DHAN_CLIENT_ID")
+token = st.sidebar.text_input("Today's Dhan token (optional override)", type="password").strip() or secret("DHAN_ACCESS_TOKEN")
+if not (client_id and token):
+    st.error("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN.")
+    st.stop()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Loading Dhan instrument list…")
+def instruments():
+    return dhan.load_instruments()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def candles(label, interval, days, _token):
+    inst = instruments()[label]
+    if interval is None:
+        return dhan.daily(inst, days, client_id, _token)
+    return dhan.intraday(inst, interval, days, client_id, _token)
+
+
+def load(label, tf):
+    interval, minutes, days = TF[tf]
+    df = candles(label, interval, days, token)
+    return an.resample(df, minutes) if minutes else df
+
+
+all_inst = instruments()
+group = st.sidebar.radio("Type", ["INDEX", "STOCK", "FUTURE"], horizontal=True)
+label = st.sidebar.selectbox("Symbol", [k for k in all_inst if k.startswith(group)])
+tf = st.sidebar.selectbox("Chart timeframe", list(TF), index=2)
+bars = st.sidebar.slider("Candles shown", 50, 500, 150, 10)
+horizon = st.sidebar.slider("Predict next N candles", 1, 6, 3)
+threshold = st.sidebar.slider("Signal threshold", 10, 70, 30, 5)
+refresh = st.sidebar.selectbox("Auto refresh (seconds)", [0, 30, 60, 180], index=2)
+
+
+def chart(d, rep, intraday):
+    v = d.tail(bars)
+    fmt = "%d %b %H:%M" if intraday else "%d %b %y"
+    x = list(v.index.strftime(fmt))
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.68, 0.16, 0.16], vertical_spacing=0.02)
+    fig.add_trace(go.Candlestick(x=x, open=v.open, high=v.high, low=v.low, close=v.close, name="Price"), 1, 1)
+    lines = [("ema9", "EMA 9", "#f5a623"), ("ema20", "EMA 20", "#4a90e2")]
+    if intraday:
+        lines += [("vwap", "VWAP", "#bd10e0")]
+    for col, name, colour in lines:
+        fig.add_trace(go.Scatter(x=x, y=v[col], name=name, line=dict(color=colour, width=1.2)), 1, 1)
+    if intraday:
+        for col, name, colour in (("pdh", "PDH", "#d0021b"), ("pdl", "PDL", "#2e9e44"), ("pivot", "Pivot", "#888888")):
+            fig.add_trace(go.Scatter(x=x, y=v[col], name=name, line=dict(color=colour, width=1, dash="dot", shape="hv")), 1, 1)
+        marked = v[v.pattern.str.contains("engulfing|Hammer|Shooting", regex=True)]
+        fig.add_trace(go.Scatter(x=list(marked.index.strftime(fmt)), y=marked.high + marked.atr * 0.3, mode="markers",
+                                 marker=dict(symbol="diamond", size=7, color="#9b9b9b"), name="Patterns",
+                                 text=marked.pattern, hoverinfo="text+x"), 1, 1)
+        if rep:
+            o, h, l, c = zip(*rep["path"])
+            fx = [f"+{i}" for i in range(1, len(c) + 1)]
+            fig.add_trace(go.Candlestick(x=fx, open=o, high=h, low=l, close=c, name="Projection (illustrative)",
+                                         opacity=0.4, increasing_line_color="#17a2b8", decreasing_line_color="#e67e22"), 1, 1)
+            for y, colour in ((rep["resistance"], "#d0021b"), (rep["support"], "#2e9e44")):
+                fig.add_hline(y=y, line=dict(color=colour, width=1), annotation_text=f"{y:,.2f}", row=1, col=1)
+    if v.volume.sum() > 0:
+        colours = ["#26a69a" if c >= o else "#ef5350" for o, c in zip(v.open, v.close)]
+        fig.add_trace(go.Bar(x=x, y=v.volume, marker_color=colours, name="Volume"), 2, 1)
+    else:
+        fig.add_annotation(text="No volume for spot index (select FUTURE for volume)", xref="x2 domain",
+                           yref="y2 domain", x=0.5, y=0.5, showarrow=False)
+    fig.add_trace(go.Scatter(x=x, y=v.rsi, name="RSI 14", line=dict(width=1.2)), 3, 1)
+    for y in (45, 55):
+        fig.add_hline(y=y, line=dict(width=0.7, dash="dash", color="#999999"), row=3, col=1)
+    fig.update_xaxes(type="category", nticks=8, rangeslider_visible=False)
+    fig.update_layout(height=760, margin=dict(l=5, r=5, t=30, b=5), legend=dict(orientation="h", y=1.04),
+                      hovermode="x unified")
+    return fig
+
+
+@st.fragment(run_every=refresh or None)
+def view():
+    try:
+        raw = load(label, tf)
+        if raw.empty:
+            st.warning("Dhan returned no candles for this selection.")
+            return
+        intraday = tf != "Daily"
+        # Commentary always uses intraday candles; the Daily chart is paired with 15m analysis
+        d = an.add_features(raw)
+        analysis_tf = tf if intraday else "15m"
+        a = d if intraday else an.add_features(load(label, "15m"))
+        rep = an.report(a, horizon, threshold)
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    st.subheader(f"{label} · {tf}")
+    m = st.columns(3)
+    m[0].metric("Last candle close", f"{a.close.iloc[-1]:,.2f}", f"{a.close.iloc[-1] - a.pdc.iloc[-1]:+,.2f}")
+    m[1].metric(f"Bias ({analysis_tf})", rep["bias"])
+    m[2].metric("Score", f"{rep['score']:+.0f} / 100")
+    st.caption(f"Latest candle starts {a.index[-1]:%d %b %Y %H:%M} IST. During market hours it is still forming.")
+
+    left, right = st.columns([2.4, 1])
+    with left:
+        st.plotly_chart(chart(d, rep if intraday else None, intraday), key="chart")
+    with right:
+        with st.container(border=True, height=520):
+            st.markdown(rep["text"])
+        st.markdown("**Backtest on loaded data**")
+        for name, r in rep["backtest"].items():
+            if r["signals"]:
+                st.write(f"{name}: right {r['hit']:.0%} of {r['signals']} signals "
+                         f"(any-candle baseline {r['base']:.0%}), average {r['avg']:+.2f} points")
+            else:
+                st.write(f"{name}: no signals")
+        st.caption("Signals overlap, costs are ignored. A hit rate near the baseline means no edge.")
+        st.dataframe(rep["factors"], hide_index=True)
+
+    if st.checkbox("Show multi-timeframe bias"):
+        cols = st.columns(4)
+        for col, other in zip(cols, ["5m", "15m", "30m", "1h"]):
+            try:
+                s = float(an.add_features(load(label, other)).score.iloc[-1])
+                col.metric(other, an.bias_of(s, threshold), f"{s:+.0f}")
+            except Exception as e:
+                col.error(str(e)[:100])
+
+
+view()
+st.caption("Rule-based estimate for study only. It is not a forecast guarantee or investment advice.")
