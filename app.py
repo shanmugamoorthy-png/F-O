@@ -726,6 +726,97 @@ PS_COST = 10.0           # bp round trip (intraday cash, as in the live review r
 PS_MIN_TR = 8            # a stock needs this many earlier out-of-sample trades to be ranked
 
 
+def _oos_trades(progress=lambda m: None):
+    """Every out-of-sample paper trade the live intraday model would have made: one model per stock, refitted each
+    year on earlier days only, same 1.7x rule, first signal of the day, held to the close."""
+    with LOCK:
+        c = db()
+        syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
+        c.close()
+    rec = []
+    for n_, sy in enumerate(syms):
+        if n_ % 5 == 0:
+            progress(f"Best-stock test: walk-forward on stock {n_ + 1}/{len(syms)} (takes a few minutes)")
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
+            c.close()
+        C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
+        C = np.take_along_axis(C, np.maximum.accumulate(np.where(np.isnan(C), 0, np.arange(75)), axis=1), axis=1)
+        ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
+        C, days = C[ok], np.array([r[0] for r, o in zip(rows, ok) if o])
+        if len(C) < 450:
+            continue
+        X3, Y3, _ = fno_feats(C)
+        yrs = np.array([d[:4] for d in days])
+        for Y in sorted(set(yrs)):
+            tr, te = days < f"{Y}-01-01", yrs == Y
+            if tr.sum() < 250 or not te.any():
+                continue
+            Xt = X3[tr].reshape(-1, 12)
+            mu, sd = Xt.mean(0), Xt.std(0) + 1e-9
+            A = (Xt - mu) / sd
+            yv = Y3[tr].reshape(-1)
+            w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(12), A.T @ (yv - yv.mean()))
+            thr = np.percentile(np.abs(A @ w), 90)
+            P = ((X3[te] - mu) / sd) @ w                                     # test days x 52 bars
+            R = np.abs(P) / thr
+            for di, d in zip(np.where(te)[0], days[te]):
+                hit = np.where(R[di - np.where(te)[0][0]] >= SIG_MIN)[0]
+                if len(hit):
+                    j = hit[0]
+                    rec.append((sy, d, Y, float(np.sign(P[di - np.where(te)[0][0], j]) * Y3[di, j])))
+            del A, Xt
+        del C, X3, Y3
+        if n_ % 20 == 0:
+            gc.collect()
+    a = pd.DataFrame(rec, columns=["sym", "day", "yr", "bp"])
+    a["net"] = a.bp - PS_COST
+    return a
+
+
+TOP_N = 20
+
+
+def top20_save(a):
+    """Rank stocks by ALL their out-of-sample results so far (8+ trades) and keep the top 20 as the tag list."""
+    g = a.groupby("sym").agg(n=("net", "size"), m=("net", "mean"))
+    g = g[g.n >= PS_MIN_TR].sort_values("m", ascending=False).head(TOP_N)
+    asof = datetime.now(IST).strftime("%Y-%m-%d")
+    with LOCK:
+        c = db()
+        c.execute("CREATE TABLE IF NOT EXISTS top20(asof TEXT, sym TEXT, rnk INTEGER, m REAL, n INTEGER)")
+        c.execute("DELETE FROM top20")
+        c.executemany("INSERT INTO top20 VALUES(?,?,?,?,?)", [(asof, sy, k, float(r.m), int(r.n))
+                                                             for k, (sy, r) in enumerate(g.iterrows(), 1)])
+        c.commit()
+        c.close()
+    live_state()["top20"], live_state()["top20_asof"] = set(g.index), asof
+
+
+def top20_load():
+    """(as-of day, set of symbols) of the saved list, or ("", set())."""
+    try:
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT asof, sym FROM top20").fetchall()
+            c.close()
+        return (rows[0][0] if rows else ""), {r[1] for r in rows}
+    except Exception:
+        return "", set()
+
+
+def top20_build():
+    ls = live_state()
+    ls["busy"] = "building the top-20 list..."
+    try:
+        top20_save(_oos_trades())
+        ls["note"] = "top-20 list rebuilt"
+    finally:
+        ls["busy"] = ""
+        gc.collect()
+
+
 def persist_job():
     """Walk-forward per stock (same model and 1.7x rule as the live alerts, refitted each year on earlier days only).
     Then for each later year: rank stocks by their EARLIER out-of-sample results, pick the top 5/10/20,
@@ -733,49 +824,8 @@ def persist_job():
     h = hist_state()
     h.update(an_running=True, analysis="Best-stock test: starting...")
     try:
-        with LOCK:
-            c = db()
-            syms = [r[0] for r in c.execute("SELECT sym FROM fnod GROUP BY sym HAVING COUNT(*) >= 450 ORDER BY sym")]
-            c.close()
-        rec = []
-        for n_, sy in enumerate(syms):
-            if n_ % 5 == 0:
-                h["analysis"] = f"Best-stock test: walk-forward on stock {n_ + 1}/{len(syms)} (takes a few minutes)"
-            with LOCK:
-                c = db()
-                rows = c.execute("SELECT day, b FROM fnod WHERE sym=? ORDER BY day", (sy,)).fetchall()
-                c.close()
-            C = np.array([np.frombuffer(r[1], np.float32) for r in rows], float)
-            C = np.take_along_axis(C, np.maximum.accumulate(np.where(np.isnan(C), 0, np.arange(75)), axis=1), axis=1)
-            ok = ~np.isnan(C[:, 0]) & (C.min(1) > 0)
-            C, days = C[ok], np.array([r[0] for r, o in zip(rows, ok) if o])
-            if len(C) < 450:
-                continue
-            X3, Y3, _ = fno_feats(C)
-            yrs = np.array([d[:4] for d in days])
-            for Y in sorted(set(yrs)):
-                tr, te = days < f"{Y}-01-01", yrs == Y
-                if tr.sum() < 250 or not te.any():
-                    continue
-                Xt = X3[tr].reshape(-1, 12)
-                mu, sd = Xt.mean(0), Xt.std(0) + 1e-9
-                A = (Xt - mu) / sd
-                yv = Y3[tr].reshape(-1)
-                w = np.linalg.solve(A.T @ A + 0.1 * len(A) * np.eye(12), A.T @ (yv - yv.mean()))
-                thr = np.percentile(np.abs(A @ w), 90)
-                P = ((X3[te] - mu) / sd) @ w                                     # test days x 52 bars
-                R = np.abs(P) / thr
-                for di, d in zip(np.where(te)[0], days[te]):
-                    hit = np.where(R[di - np.where(te)[0][0]] >= SIG_MIN)[0]
-                    if len(hit):
-                        j = hit[0]
-                        rec.append((sy, d, Y, float(np.sign(P[di - np.where(te)[0][0], j]) * Y3[di, j])))
-                del A, Xt
-            del C, X3, Y3
-            if n_ % 20 == 0:
-                gc.collect()
-        a = pd.DataFrame(rec, columns=["sym", "day", "yr", "bp"])
-        a["net"] = a.bp - PS_COST
+        a = _oos_trades(lambda m: h.update(analysis=m))
+        top20_save(a)
         years = sorted(a.yr.unique())
         if len(years) < 2:
             h["analysis"] = "Best-stock test: not enough years of history"
@@ -1272,6 +1322,7 @@ def paper_db():
         c.commit()
         c.close()
     _add_col("fnopaper", "tag")
+    _add_col("fnopaper", "top20")
 
 
 def live_scan(now):
@@ -1317,14 +1368,16 @@ def live_scan(now):
             side = "BUY" if (((X[j] - m["mu"]) / m["sd"]) @ m["w"]) > 0 else "SELL"
             t_in = f"{(555 + 5 * k + 5) // 60:02d}:{(555 + 5 * k + 5) % 60:02d}"
             tag = big_move_tag(m.get("dc", []), float(row[k]), last=1)
+            t20 = "yes" if sy in ls.get("top20", set()) else ""
             with LOCK:
                 c = db()
-                c.execute("INSERT OR IGNORE INTO fnopaper(day,sym,t_in,side,entry,ratio,tag) VALUES(?,?,?,?,?,?,?)",
-                          (d_s, sy, t_in, side, float(row[k]), float(ratio[j]), tag))
+                c.execute("INSERT OR IGNORE INTO fnopaper(day,sym,t_in,side,entry,ratio,tag,top20) VALUES(?,?,?,?,?,?,?,?)",
+                          (d_s, sy, t_in, side, float(row[k]), float(ratio[j]), tag, t20))
                 c.commit()
                 c.close()
             send_telegram(f"PAPER {side} {sy} at {t_in}, price {row[k]:,.2f}. Signal {ratio[j]:.1f}x"
                           f"{' (STRONG)' if ratio[j] >= STRONG else ''}. Paper trade, exit about 15:25."
+                          + ("\n⭐ Top-20 stock (best past results of the model)" if t20 else "")
                           + (f"\n⚠ {tag}: the model was not built for such days." if tag else "") + " Research, not advice.")
             n += 1
         except Exception as e:
@@ -1384,6 +1437,7 @@ def live_loop():
                     ls["busy"] = "topping up history..."
                     fno_job(10)
                     live_fit()
+                    ls["top20_asof"], ls["top20"] = top20_load()
                 if ls["models"] and 555 + 5 * 13 <= mnow < 14 * 60 + 40 and ((mnow - 555) % 5 > 0 or now.second >= 25):
                     kmax = (mnow - 555) // 5 - 1
                     if kmax > ls["scanned"] or ls.get("scanned_day") != d_s:
@@ -1419,6 +1473,14 @@ def live_loop():
                     gc.collect()
                     if swing_list(now):
                         ls["swing"] = d_s
+            asof = ls.get("top20_asof") or top20_load()[0]
+            ls["top20_asof"] = asof
+            quiet = now.weekday() >= 5 or mnow >= 18 * 60 + 30 or mnow < 8 * 60
+            if (quiet and (not asof or (now - datetime.strptime(asof, "%Y-%m-%d")).days >= 7)
+                    and not hist_state()["an_running"] and ls.get("top20_try") != d_s):
+                ls["top20_try"] = d_s                                     # at most one attempt a day
+                top20_build()                                             # weekly, outside market hours
+                ls["top20_asof"], ls["top20"] = top20_load()
         except Exception as e:
             ls["note"] = f"loop error: {str(e)[:120]}"
         time.sleep(20)
@@ -1627,6 +1689,8 @@ def intraday_tab():
     if t.empty:
         st.info("No paper trades yet. Alerts start after 10:20 on a market day.")
         return
+    if "top20" not in t:
+        t = t.assign(top20="")
     dn = t[t.bp.notna()]
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Closed trades", f"{len(dn)}")
@@ -1639,12 +1703,19 @@ def intraday_tab():
         st.caption(f"Normal trades: {int((~bg).sum())}, average {dn[~bg].bp.mean() if (~bg).any() else float('nan'):+.1f} bp  ·  "
                    f"⚠ after a big move: {int(bg.sum())}, average {dn[bg].bp.mean() if bg.any() else float('nan'):+.1f} bp "
                    f"(a move over {BIG_SIGMA:g}x the stock's normal daily move, e.g. results day)")
+        t2 = dn.top20.fillna("") == "yes"
+        asof = ls.get("top20_asof") or top20_load()[0]
+        st.caption(f"⭐ Top-20 stocks: {int(t2.sum())} trades" + (f", {(dn[t2].bp > 0).mean() * 100:.0f}% right, average "
+                   f"{dn[t2].bp.mean():+.1f} bp" if t2.any() else "") + f"  ·  other stocks: {int((~t2).sum())} trades"
+                   + (f", average {dn[~t2].bp.mean():+.1f} bp" if (~t2).any() else "")
+                   + f"  ·  list {'as of ' + asof if asof else 'not built yet (builds automatically after 18:30 or at the weekend)'}"
+                   ". Tag only: the alert rule is unchanged.")
     days = list(dict.fromkeys(t.day))
     dsel = st.selectbox("Day", days, index=0, key="i_day")
     d = t[t.day == dsel].copy()
     sm = sectors_cached()
     tg = d.tag.fillna("")
-    show = pd.DataFrame({"Time": d.t_in, "Stock": d.sym + np.where(tg != "", " ⚠", ""), "Sector": d.sym.map(sm).fillna(""), "Side": d.side,
+    show = pd.DataFrame({"Time": d.t_in, "Stock": d.sym + np.where(d.top20.fillna("") == "yes", " ⭐", "") + np.where(tg != "", " ⚠", ""), "Sector": d.sym.map(sm).fillna(""), "Side": d.side,
                          "Entry": txt(d.entry, "{:,.2f}"), "Strength": txt(d.ratio, "{:.1f}x"), "Exit": txt(d.exit, "{:,.2f}", "open"),
                          "Result (bp)": txt(d.bp, "{:+.1f}", "open"), "Note": tg.str.replace("after big move: ", "big move: ", regex=False)})
     sty = (show.style
