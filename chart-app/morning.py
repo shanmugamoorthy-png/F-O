@@ -36,6 +36,14 @@ def day_signals(df, entry="10:15"):
             rest = g[g.index > rows.index[key.get_loc(t)]]
             after[t] = list(zip(rest.open, rest.high, rest.low))
     out["Path"] = [after[t] for t in key]
+    # for breakout entries: previous day levels, and candles from the signal candle onward
+    out["PDH"], out["PDL"] = rows.pdh.values, rows.pdl.values
+    bars = {t: [] for t in key}
+    for t, g in d.groupby(day):
+        if t in bars:
+            rest = g[g.index >= rows.index[key.get_loc(t)]]
+            bars[t] = list(zip(rest.index.strftime("%H:%M"), rest.open, rest.high, rest.low, rest.close))
+    out["Bars"] = [bars[t] for t in key]
     out = out.dropna(subset=["Close"])
     out["Move %"] = (out.Close / out.Entry - 1) * 100
     return out
@@ -178,3 +186,70 @@ def risk_reward(signals, sessions=50, level=30, cost=0.10, ratio=2.0, min_rel=0.
             row["Positive in both"] = bool(row["Older net %"] > 0 and row["Newer net %"] > 0)
             rows.append(row)
     return pd.DataFrame(rows).round(2)
+
+
+def nifty_state(df):
+    """{(date, candle start): +1 / -1 / 0}. +1: NIFTY above both its VWAP and the day's open; -1: below both."""
+    if df.empty:
+        return {}
+    d = an.add_features(df)
+    day_open = d.open.groupby(d.index.date).transform("first")
+    up = (d.close > d.vwap) & (d.close > day_open)
+    down = (d.close < d.vwap) & (d.close < day_open)
+    return {(t.date(), t.strftime("%H:%M")): int(u) - int(w) for t, u, w in zip(d.index, up, down)}
+
+
+def breakout_entry(bars, sign, pdh, pdl, date, nifty=None, last_start="13:45"):
+    """First candle that closes beyond PDH (long) or PDL (short), with NIFTY agreeing if given.
+    Returns (candle start, entry price, later (open, high, low) candles) or None."""
+    for i, (start, _, _, _, close) in enumerate(bars):
+        if start > last_start:
+            break
+        broke = close > pdh if sign > 0 else close < pdl
+        if broke and (nifty is None or nifty.get((date, start)) == sign):
+            return start, close, [(o, h, l) for _, o, h, l, _ in bars[i + 1:]]
+    return None
+
+
+EXITS = ((0.0, 0.0), (0.5, 1.0), (0.75, 1.5), (1.0, 2.0), (1.5, 3.0), (2.0, 4.0))
+
+
+def breakout_test(signals, nifty, sessions=50, level=30, cost=0.10, min_rel=0.0):
+    """Watch the top 10 picked at the signal time; trade only on a breakout. Returns (summary, trades)."""
+    days = sorted(signals.Date.unique())[-sessions:]
+    half = len(days) // 2
+    picks = pick(signals, sessions, level, cost=cost, min_rel=min_rel)[0]
+    if picks.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    watch = picks[["Date", "Side", "Rank", "Symbol", "Score"]].merge(
+        signals[["Date", "Symbol", "Close", "PDH", "PDL", "Bars"]], on=["Date", "Symbol"])
+    trades = []
+    for use_nifty in (False, True):
+        entries = []
+        for r in watch.itertuples():
+            sign = 1 if r.Side == "BULLISH" else -1
+            found = breakout_entry(r.Bars, sign, r.PDH, r.PDL, r.Date, nifty if use_nifty else None)
+            if found:
+                entries.append((r, sign, *found))
+        for stop, target in EXITS:
+            for r, sign, start, price, path in entries:
+                gross, why = exit_trade(price, r.Close, path, sign, stop, target)
+                trades.append({"NIFTY filter": "On" if use_nifty else "Off", "Side": r.Side, "Stop %": stop,
+                               "Target %": target, "Date": r.Date, "Symbol": r.Symbol, "Entry candle": start,
+                               "Entry": price, "Exit": why, "Net %": gross - cost})
+    t = pd.DataFrame(trades)
+    if t.empty:
+        return pd.DataFrame(), t
+    rows = []
+    for keys, g in t.groupby(["NIFTY filter", "Side", "Stop %", "Target %"]):
+        older, newer = g[g.Date.isin(days[:half])], g[g.Date.isin(days[half:])]
+        rows.append({**dict(zip(["NIFTY filter", "Side", "Stop %", "Target %"], keys)),
+                     "Trades": len(g), "Days traded": g.Date.nunique(),
+                     "Target hit %": (g.Exit == "Target").mean() * 100, "Stop hit %": (g.Exit == "Stop").mean() * 100,
+                     "Win rate %": (g["Net %"] > 0).mean() * 100, "Avg net %": g["Net %"].mean(),
+                     "Older trades": len(older), "Older net %": older["Net %"].mean(),
+                     "Newer trades": len(newer), "Newer net %": newer["Net %"].mean()})
+    out = pd.DataFrame(rows)
+    out["Positive in both"] = ((out["Older net %"] > 0) & (out["Newer net %"] > 0)
+                               & (out[["Older trades", "Newer trades"]].min(axis=1) >= 30))
+    return out.round(2), t.round(2)

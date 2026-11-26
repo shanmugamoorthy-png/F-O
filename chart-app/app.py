@@ -113,13 +113,15 @@ def backtest_page():
         try:
             signals, failed = morning.collect(list(stocks), fetch, entry,
                                               lambda i, n: bar.progress(i / n, text=f"Loading {i} of {n}"))
-            st.session_state.morning = (entry, signals, failed)
+            index = next(v for k, v in instruments().items() if k == "INDEX | NIFTY")
+            nifty = morning.nifty_state(an.resample(dhan.intraday(index, 5, 90, client_id, token), 15))
+            st.session_state.morning = (entry, signals, failed, nifty)
         except Exception as e:
             st.error(str(e))
         bar.empty()
     if "morning" not in st.session_state:
         return
-    done_entry, signals, failed = st.session_state.morning
+    done_entry, signals, failed, nifty = st.session_state.morning
     if signals.empty:
         st.warning("No data returned.")
         return
@@ -139,6 +141,17 @@ def backtest_page():
                f"{trades.Date.min():%d %b} to {trades.Date.max():%d %b %Y}.")
     st.markdown("**Summary**")
     st.dataframe(summary, hide_index=True)
+    st.markdown("**Breakout entry: wait for a 15m close beyond PDH / PDL**")
+    result, entries = morning.breakout_test(signals, nifty, sessions, level, cost, min_rel)
+    if result.empty:
+        st.write("No breakouts met these filters.")
+    else:
+        st.dataframe(result, hide_index=True)
+        st.download_button("Download breakout results (CSV)", result.to_csv(index=False), "breakout_results.csv",
+                           "text/csv")
+    st.caption("Watches the top 10 from the pick time; enters at the first 15m close beyond the level, up to 14:00. "
+               "Stop 0 means exit at the close. NIFTY filter On: NIFTY is above (bullish) or below (bearish) both "
+               "its VWAP and day open on that candle. 24 settings are tried, so one may look good by luck.")
     st.markdown("**1:2 risk-reward (target = 2 × stop)**")
     rr = morning.risk_reward(signals, sessions, level, cost, min_rel=min_rel)
     st.dataframe(rr, hide_index=True)
