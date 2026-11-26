@@ -22,16 +22,16 @@ def pivot_levels(high, low, close):
                 r1=2 * pivot - low, s1=2 * pivot - high)
 
 
-def session_closed(last_candle, now=None):
+def session_closed(last_candle, now=None, end=(15, 30)):
     """True when the session of the latest candle has ended, so levels apply to the next session."""
     now = now or pd.Timestamp.now(tz="Asia/Kolkata")
-    return last_candle.date() < now.date() or (now.hour, now.minute) >= (15, 30)
+    return last_candle.date() < now.date() or (now.hour, now.minute) >= end
 
 
-def current_view(d, now=None):
+def current_view(d, now=None, end=(15, 30)):
     """Copy of d for the live estimate. After the close, the last row gets next-session levels.
     Historical rows are untouched. Needs at least two sessions."""
-    closed = session_closed(d.index[-1], now)
+    closed = session_closed(d.index[-1], now, end)
     view = d.copy()
     if closed:
         s = d.groupby(d.index.date).agg(AGG)
@@ -137,9 +137,9 @@ def session_summary(g):
             f"the first-hour range.")
 
 
-def report(d, horizon=3, threshold=30, now=None):
+def report(d, horizon=3, threshold=30, now=None, end=(15, 30)):
     """Commentary, scenarios and an illustrative projected path from the latest candle."""
-    view, closed = current_view(d, now)
+    view, closed = current_view(d, now, end)
     last = view.iloc[-1]
     day = pd.Series(d.index.date, index=d.index)
     sessions = [g for _, g in d.groupby(day)]

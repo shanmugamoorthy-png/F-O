@@ -175,7 +175,8 @@ def view():
         d = an.add_features(raw)
         analysis_tf = tf if intraday else "15m"
         a = d if intraday else an.add_features(load(label, "15m"))
-        rep = an.report(a, horizon, threshold)
+        end = dhan.SESSION_END[all_inst[label]["segment"]]
+        rep = an.report(a, horizon, threshold, end=end)
     except Exception as e:
         st.error(str(e))
         return
@@ -204,7 +205,7 @@ def view():
         cols = st.columns(4)
         for col, other in zip(cols, ["5m", "15m", "30m", "1h"]):
             try:
-                s = float(an.current_view(an.add_features(load(label, other)))[0].score.iloc[-1])
+                s = float(an.current_view(an.add_features(load(label, other)), end=end)[0].score.iloc[-1])
                 col.metric(other, an.bias_of(s, threshold), f"{s:+.0f}")
             except Exception as e:
                 col.error(str(e)[:100])

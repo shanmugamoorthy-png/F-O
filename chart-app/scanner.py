@@ -4,13 +4,14 @@ import time
 import pandas as pd
 
 import analysis as an
+import dhan
 
 
 def score_stock(df, threshold=30, now=None):
     """One result row from intraday candles, or None if there is too little history."""
     if df.empty or len(set(df.index.date)) < 3:
         return None
-    view, _ = an.current_view(an.add_features(df), now)
+    view, _ = an.current_view(an.add_features(df), now, dhan.SESSION_END["NSE_EQ"])
     last = view.iloc[-1]
     days = pd.Series(df.index.date, index=df.index)
     closes = df.close.groupby(days).last()

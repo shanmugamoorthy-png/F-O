@@ -13,6 +13,16 @@ MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
 INDEX_FALLBACK = {"NIFTY": "13", "BANKNIFTY": "25", "FINNIFTY": "27", "MIDCPNIFTY": "442", "SENSEX": "51"}
 
 
+# End of continuous trading (IST). F&O stocks move to the closing auction at 15:15; derivatives run to 15:40.
+SESSION_END = {"IDX_I": (15, 30), "NSE_EQ": (15, 15), "NSE_FNO": (15, 40), "BSE_FNO": (15, 40)}
+
+
+def trim_session(df, segment):
+    """Keep candles inside market hours. Only derivatives have candles after 15:29."""
+    last = "15:39" if segment.endswith("_FNO") else "15:29"
+    return df.between_time("09:15", last)
+
+
 def load_instruments():
     """Return {label: {id, segment, instrument}} for indices, F&O stocks and nearest-expiry futures."""
     r = requests.get(MASTER, stream=True, timeout=180)
@@ -79,7 +89,7 @@ def intraday(inst, interval, days, client_id, token):
     df = to_frame(_post("/charts/intraday", body, client_id, token))
     if df.empty:
         return df
-    return df.between_time("09:15", "15:29")
+    return trim_session(df, inst["segment"])
 
 
 def daily(inst, days, client_id, token):
