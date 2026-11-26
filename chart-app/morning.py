@@ -150,3 +150,31 @@ def compare(signals, sessions=50, level=30, cost=0.10, target=0.0):
     out["Positive in both"] = ((out["Older net %"] > 0) & (out["Newer net %"] > 0)
                                & (out[["Older trades", "Newer trades"]].min(axis=1) >= 30))
     return out.round(2)
+
+
+RISK_STOPS = (0.5, 0.75, 1.0, 1.5, 2.0)
+
+
+def risk_reward(signals, sessions=50, level=30, cost=0.10, ratio=2.0, min_rel=0.0):
+    """Stop S with target ratio*S, per side, on all dates and on the older and newer halves."""
+    days = sorted(signals.Date.unique())[-sessions:]
+    half = len(days) // 2
+    parts = (("All", days), ("Older", days[:half]), ("Newer", days[half:]))
+    rows = []
+    for stop in RISK_STOPS:
+        result = {name: pick(signals[signals.Date.isin(d)], len(d), level, cost=cost, stop=stop,
+                             target=stop * ratio, min_rel=min_rel)[0] for name, d in parts if len(d)}
+        for side in ("BULLISH", "BEARISH"):
+            s = {n: (t[t.Side == side] if len(t) else t) for n, t in result.items()}
+            a = s.get("All", pd.DataFrame())
+            if a.empty:
+                continue
+            row = {"Side": side, "Stop %": stop, "Target %": stop * ratio, "Trades": len(a),
+                   "Target hit %": (a.Exit == "Target").mean() * 100, "Stop hit %": (a.Exit == "Stop").mean() * 100,
+                   "Closed %": (a.Exit == "Close").mean() * 100, "Win rate %": (a["Net %"] > 0).mean() * 100,
+                   "Avg net %": a["Net %"].mean()}
+            for n in ("Older", "Newer"):
+                row[f"{n} net %"] = s[n]["Net %"].mean() if n in s and len(s[n]) else float("nan")
+            row["Positive in both"] = bool(row["Older net %"] > 0 and row["Newer net %"] > 0)
+            rows.append(row)
+    return pd.DataFrame(rows).round(2)

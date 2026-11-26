@@ -139,6 +139,12 @@ def backtest_page():
                f"{trades.Date.min():%d %b} to {trades.Date.max():%d %b %Y}.")
     st.markdown("**Summary**")
     st.dataframe(summary, hide_index=True)
+    st.markdown("**1:2 risk-reward (target = 2 × stop)**")
+    rr = morning.risk_reward(signals, sessions, level, cost, min_rel=min_rel)
+    st.dataframe(rr, hide_index=True)
+    st.download_button("Download 1:2 results (CSV)", rr.to_csv(index=False), "risk_reward_1to2.csv", "text/csv")
+    st.caption("Uses the sessions, score, cost and volume filter above; the stop and target boxes don't apply here. "
+               "If one 15m candle touches both levels, the stop is counted.")
     if st.checkbox("Compare stop-loss and volume settings (older vs newer dates)"):
         table = morning.compare(signals, sessions, level, cost, target)
         st.dataframe(table, hide_index=True)
