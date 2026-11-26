@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 
 import analysis as an
 import dhan
+import morning
 import scanner
 
 st.set_page_config(page_title="F&O Price Action", layout="wide")
@@ -99,7 +100,61 @@ def scanner_page():
             st.write("\n".join(f"- {f}" for f in failed))
 
 
-page = st.sidebar.radio("Page", ["Chart", "Top 10 scanner"])
+def backtest_page():
+    st.subheader("Backtest: top 10 at a set time, held to the close")
+    entry = st.selectbox("Pick time (15m candle closed)", ["09:30", "09:45", "10:15", "11:15", "12:15"], index=2)
+    stocks = {k.split("| ", 1)[1]: v for k, v in instruments().items() if k.startswith("STOCK")}
+    st.caption(f"Loads about 90 days for {len(stocks)} stocks. Takes several minutes. Don't change settings while it runs.")
+    if st.button("Run backtest", type="primary"):
+        def fetch(symbol):
+            return an.resample(dhan.intraday(stocks[symbol], 5, 90, client_id, token), 15)
+
+        bar = st.progress(0.0, text="Loading…")
+        try:
+            signals, failed = morning.collect(list(stocks), fetch, entry,
+                                              lambda i, n: bar.progress(i / n, text=f"Loading {i} of {n}"))
+            st.session_state.morning = (entry, signals, failed)
+        except Exception as e:
+            st.error(str(e))
+        bar.empty()
+    if "morning" not in st.session_state:
+        return
+    done_entry, signals, failed = st.session_state.morning
+    if signals.empty:
+        st.warning("No data returned.")
+        return
+    # These filters reuse the loaded data, so changing them is instant
+    sessions = st.slider("Sessions to test", 5, 50, 20, 5)
+    level = st.slider("Minimum score", 10, 85, 30, 5)
+    cost = st.number_input("Round-trip cost and slippage (%)", 0.0, 1.0, 0.10, 0.05)
+    trades, daily, summary = morning.pick(signals, sessions, level, cost=cost)
+    if trades.empty:
+        st.warning("No stocks met the minimum score.")
+        return
+    st.caption(f"Picked at {done_entry}, entry at that candle's close, exit at the day's last continuous candle. "
+               f"{trades.Date.min():%d %b} to {trades.Date.max():%d %b %Y}.")
+    st.markdown("**Summary**")
+    st.dataframe(summary, hide_index=True)
+    st.markdown("**Day by day (average of the picks)**")
+    st.dataframe(daily.sort_values("Date", ascending=False), hide_index=True)
+    st.markdown("**Closing position of each pick**")
+    chosen = st.selectbox("Date", sorted(trades.Date.unique(), reverse=True), format_func=lambda x: f"{x:%a %d %b %Y}")
+    for side in ("BULLISH", "BEARISH"):
+        st.markdown(f"*{side.title()}*")
+        st.dataframe(trades[(trades.Date == chosen) & (trades.Side == side)].drop(columns=["Date", "Side"]),
+                     hide_index=True)
+    st.download_button("Download all trades (CSV)", trades.to_csv(index=False), "morning_backtest.csv", "text/csv")
+    st.caption("Limits: uses today's F&O list, has no stop-loss, assumes a fill at the candle close, and measures "
+               "stock prices, not option premiums. Trades on the same day move together. Not investment advice.")
+    if failed:
+        with st.expander(f"Skipped: {len(failed)}"):
+            st.write("\n".join(f"- {f}" for f in failed))
+
+
+page = st.sidebar.radio("Page", ["Chart", "Top 10 scanner", "10:15 backtest"])
+if page == "10:15 backtest":
+    backtest_page()
+    st.stop()
 if page == "Top 10 scanner":
     scanner_page()
     st.stop()
