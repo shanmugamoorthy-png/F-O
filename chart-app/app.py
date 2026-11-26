@@ -14,7 +14,7 @@ st.set_page_config(page_title="F&O Price Action", layout="wide")
 
 # label: (Dhan source interval, resample minutes, calendar days to fetch)
 TF = {"1m": (1, None, 10), "3m": (1, 3, 20), "5m": (5, None, 45), "10m": (5, 10, 60),
-      "15m": (15, None, 90), "30m": (15, 30, 90), "75m": (15, 75, 90), "1h": (15, 60, 90), "Daily": (None, None, 730)}
+      "15m": (5, 15, 90), "30m": (5, 30, 90), "75m": (5, 75, 90), "1h": (5, 60, 90), "Daily": (None, None, 730)}
 
 
 def secret(name):

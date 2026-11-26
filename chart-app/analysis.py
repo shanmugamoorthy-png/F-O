@@ -174,7 +174,9 @@ def report(d, horizon=3, threshold=30, now=None):
         lines.append("- Recent patterns: " + ", ".join(f"{p} ({t:%d %b %H:%M})" for t, p in recent.pattern.items()))
 
     levels = sorted({float(x) for x in (last.pdh, last.pdl, last.pdh2, last.pdl2, last["pivot"], last.r1, last.s1,
-                                        sessions[-1].high.max(), sessions[-1].low.min(), last.vwap) if pd.notna(x)})
+                                        sessions[-1].high.max(), sessions[-1].low.min(),
+                                        np.nan if closed else last.vwap)      # VWAP resets at the next open
+              if pd.notna(x)})
     res = next((x for x in levels if x > c + 0.25 * atr), c + atr)
     sup = next((x for x in reversed(levels) if x < c - 0.25 * atr), c - atr)
     res2 = next((x for x in levels if x > res + 0.25 * atr), res + atr)
