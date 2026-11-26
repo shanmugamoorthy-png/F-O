@@ -3,6 +3,8 @@
 Index, F&O stock and futures candles (1m to Daily), EMA, VWAP, CPR/pivot, patterns, RSI,
 commentary from the previous 2 sessions, next-candle estimate and a backtest.
 
+The **Top 10 scanner** page ranks F&O stocks by score (bullish and bearish).
+
 ## Deploy on Render
 1. Render dashboard > New > Blueprint > pick this repository and branch.
 2. Enter `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, and an `APP_PASSWORD` of your choice.

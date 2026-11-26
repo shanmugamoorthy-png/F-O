@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 
 import analysis as an
 import dhan
+import scanner
 
 st.set_page_config(page_title="F&O Price Action", layout="wide")
 
@@ -53,6 +54,55 @@ def load(label, tf):
     df = candles(label, interval, days, token)
     return an.resample(df, minutes) if minutes else df
 
+
+def scanner_page():
+    st.subheader("Top 10 F&O stocks by score")
+    scan_tf = st.selectbox("Scan timeframe", ["5m", "15m", "30m", "1h"], index=1)
+    level = st.slider("Minimum score (either direction)", 10, 70, 30, 5)
+    stocks = {k.split("| ", 1)[1]: v for k, v in instruments().items() if k.startswith("STOCK")}
+    st.caption(f"{len(stocks)} stocks. Takes a few minutes. Don't change any setting while it runs.")
+    if st.button("Scan now", type="primary"):
+        interval, minutes, _ = TF[scan_tf]
+        days = 20 if scan_tf in ("5m", "15m") else 45
+
+        def fetch(symbol):
+            df = dhan.intraday(stocks[symbol], interval, days, client_id, token)
+            return an.resample(df, minutes) if minutes else df
+
+        bar = st.progress(0.0, text="Scanning…")
+        try:
+            table, failed = scanner.scan(list(stocks), fetch, level,
+                                         lambda i, n: bar.progress(i / n, text=f"Scanning {i} of {n}"))
+            st.session_state.scan = (scan_tf, level, table, failed)
+        except Exception as e:
+            st.error(str(e))
+        bar.empty()
+    if "scan" not in st.session_state:
+        return
+    done_tf, done_level, table, failed = st.session_state.scan
+    if table.empty:
+        st.warning("No stocks returned data.")
+    else:
+        st.caption(f"{done_tf} scan, minimum score {done_level}. Latest candle {table['As of'].max():%d %b %H:%M} IST. "
+                   f"{len(table)} stocks scored.")
+        for title, bias in (("Top 10 bullish", "BULLISH"), ("Top 10 bearish", "BEARISH")):
+            st.markdown(f"**{title}**")
+            rows = scanner.top(table, bias)
+            if rows.empty:
+                st.write("None meet the minimum score.")
+            else:
+                st.dataframe(rows, hide_index=True)
+        st.caption("Ties in score are ordered by relative volume. A high score is not a win probability: "
+                   "open the stock on the Chart page and check its backtest.")
+    if failed:
+        with st.expander(f"Skipped: {len(failed)}"):
+            st.write("\n".join(f"- {f}" for f in failed))
+
+
+page = st.sidebar.radio("Page", ["Chart", "Top 10 scanner"])
+if page == "Top 10 scanner":
+    scanner_page()
+    st.stop()
 
 all_inst = instruments()
 group = st.sidebar.radio("Type", ["INDEX", "STOCK", "FUTURE"], horizontal=True)
