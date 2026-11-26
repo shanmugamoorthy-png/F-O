@@ -29,6 +29,13 @@ def day_signals(df, entry="10:15"):
     out = pd.DataFrame({"Date": key.date, "Score": rows.score.round().astype(int).values,
                         "Rel volume": relative.reindex(key).fillna(0).round(2).values,
                         "Entry": rows.close.values, "Close": exits.reindex(key).values})
+    # (open, high, low) of every candle after entry, needed to test stops and targets
+    after = {t: [] for t in key}
+    for t, g in d.groupby(day):
+        if t in after:
+            rest = g[g.index > rows.index[key.get_loc(t)]]
+            after[t] = list(zip(rest.open, rest.high, rest.low))
+    out["Path"] = [after[t] for t in key]
     out = out.dropna(subset=["Close"])
     out["Move %"] = (out.Close / out.Entry - 1) * 100
     return out
@@ -56,23 +63,45 @@ def collect(symbols, fetch, entry="10:15", progress=None, pause=0.25, max_fails=
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failed
 
 
-def pick(signals, sessions=20, level=30, n=10, cost=0.10):
+def exit_trade(entry, close, path, sign, stop=0.0, target=0.0):
+    """Gross % and exit reason. sign +1 long, -1 short; stop/target in percent, 0 = off.
+    A gap through a level fills at the candle open. If one candle touches both, the stop counts."""
+    for o, h, l in path:
+        opened = (o / entry - 1) * 100 * sign
+        worst = ((l if sign > 0 else h) / entry - 1) * 100 * sign
+        best = ((h if sign > 0 else l) / entry - 1) * 100 * sign
+        if stop and opened <= -stop:
+            return opened, "Stop"
+        if target and opened >= target:
+            return opened, "Target"
+        if stop and worst <= -stop:
+            return -stop, "Stop"
+        if target and best >= target:
+            return target, "Target"
+    return (close / entry - 1) * 100 * sign, "Close"
+
+
+def pick(signals, sessions=20, level=30, n=10, cost=0.10, stop=0.0, target=0.0, min_rel=0.0):
     """Top n per side per day. Returns (trades, daily table, summary). cost is round-trip percent."""
     days = sorted(signals.Date.unique())[-sessions:]
     data = signals[signals.Date.isin(days)]
     trades = []
     for day, g in data.groupby("Date"):
         for side, sign in (("BULLISH", 1), ("BEARISH", -1)):
-            c = g[g.Score * sign >= level].assign(Strength=lambda x: x.Score * sign)
+            c = g[(g.Score * sign >= level) & (g["Rel volume"] >= min_rel)].assign(Strength=lambda x: x.Score * sign)
             c = c.sort_values(["Strength", "Rel volume", "Symbol"], ascending=[False, False, True]).head(n)
             if len(c):
-                gross = c["Move %"] * sign
-                trades.append(c.assign(Side=side, Rank=range(1, len(c) + 1), **{"Gross %": gross, "Net %": gross - cost}))
+                done = [exit_trade(r.Entry, r.Close, r.Path, sign, stop, target) for r in c.itertuples()]
+                gross = pd.Series([x[0] for x in done], index=c.index)
+                trades.append(c.assign(Side=side, Rank=range(1, len(c) + 1), Exit=[x[1] for x in done],
+                                       **{"Gross %": gross, "Net %": gross - cost, "Hold %": c["Move %"] * sign,
+                                          "All stocks %": g["Move %"].mean() * sign}))
     if not trades:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     t = pd.concat(trades, ignore_index=True)
     t["Result"] = t["Net %"].map(lambda v: "Win" if v > 0 else "Loss")
-    t = t[["Date", "Side", "Rank", "Symbol", "Score", "Rel volume", "Entry", "Close", "Gross %", "Net %", "Result"]]
+    t = t[["Date", "Side", "Rank", "Symbol", "Score", "Rel volume", "Entry", "Close", "Exit", "Gross %", "Net %",
+           "Result", "Hold %", "All stocks %"]]
     market = data.groupby("Date")["Move %"].mean()
     daily = t.pivot_table(index="Date", columns="Side", values="Net %", aggfunc="mean")
     daily.columns = [f"{c.title()} net %" for c in daily.columns]
@@ -82,11 +111,42 @@ def pick(signals, sessions=20, level=30, n=10, cost=0.10):
         s = t[t.Side == side]
         if s.empty:
             continue
-        per_day = s.groupby("Date")[["Gross %", "Net %"]].mean()
-        base = (market.reindex(per_day.index) * sign).mean()      # same days, same direction, every stock
+        per_day = s.groupby("Date")[["Gross %", "Net %", "Hold %", "All stocks %"]].mean()
         summary.append({"Side": side, "Days": len(per_day), "Trades": len(s),
                         "Win rate %": (s["Net %"] > 0).mean() * 100,
                         "Avg gross %": s["Gross %"].mean(), "Avg net %": s["Net %"].mean(),
                         "Winning days": int((per_day["Net %"] > 0).sum()),
-                        "Edge vs all stocks %": per_day["Gross %"].mean() - base})
+                        "Stopped %": (s.Exit == "Stop").mean() * 100,
+                        # selection edge, held to close: picks against every stock, same days and direction
+                        "Edge vs all stocks %": (per_day["Hold %"] - per_day["All stocks %"]).mean()})
     return t.round(2), daily.round(2).reset_index(), pd.DataFrame(summary).round(2)
+
+
+STOPS = (0.0, 0.5, 1.0, 1.5, 2.0)
+MIN_REL = (0.0, 1.5, 2.0, 4.0)
+
+
+def compare(signals, sessions=50, level=30, cost=0.10, target=0.0):
+    """Every stop x relative-volume setting, scored separately on the older and newer half of the dates."""
+    days = sorted(signals.Date.unique())[-sessions:]
+    half = len(days) // 2
+    older, newer = signals[signals.Date.isin(days[:half])], signals[signals.Date.isin(days[half:])]
+    rows = []
+    for stop in STOPS:
+        for rel in MIN_REL:
+            result = {}
+            for name, data in (("Older", older), ("Newer", newer)):
+                trades = pick(data, len(days), level, cost=cost, stop=stop, target=target, min_rel=rel)[0]
+                result[name] = trades
+            for side in ("BULLISH", "BEARISH"):
+                row = {"Side": side, "Stop %": stop, "Min rel volume": rel}
+                for name, trades in result.items():
+                    s = trades[trades.Side == side] if len(trades) else trades
+                    row[f"{name} net %"] = s["Net %"].mean() if len(s) else float("nan")
+                    row[f"{name} trades"] = len(s)
+                rows.append(row)
+    out = pd.DataFrame(rows)
+    # Judged on both halves; thin samples never qualify
+    out["Positive in both"] = ((out["Older net %"] > 0) & (out["Newer net %"] > 0)
+                               & (out[["Older trades", "Newer trades"]].min(axis=1) >= 30))
+    return out.round(2)

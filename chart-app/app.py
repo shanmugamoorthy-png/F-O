@@ -124,17 +124,27 @@ def backtest_page():
         st.warning("No data returned.")
         return
     # These filters reuse the loaded data, so changing them is instant
-    sessions = st.slider("Sessions to test", 5, 50, 20, 5)
+    sessions = st.slider("Sessions to test", 10, 50, 50, 5)
     level = st.slider("Minimum score", 10, 85, 30, 5)
     cost = st.number_input("Round-trip cost and slippage (%)", 0.0, 1.0, 0.10, 0.05)
-    trades, daily, summary = morning.pick(signals, sessions, level, cost=cost)
+    stop = st.selectbox("Stop-loss (% move in the stock, 0 = none)", list(morning.STOPS))
+    target = st.selectbox("Target (%, 0 = none)", [0.0, 1.0, 1.5, 2.0, 3.0])
+    min_rel = st.selectbox("Minimum relative volume (0 = no filter)", list(morning.MIN_REL))
+    trades, daily, summary = morning.pick(signals, sessions, level, cost=cost, stop=stop, target=target,
+                                          min_rel=min_rel)
     if trades.empty:
-        st.warning("No stocks met the minimum score.")
+        st.warning("No stocks met these filters.")
         return
-    st.caption(f"Picked at {done_entry}, entry at that candle's close, exit at the day's last continuous candle. "
+    st.caption(f"Picked at {done_entry}, entry at that candle's close, exit at stop, target or the last continuous candle. "
                f"{trades.Date.min():%d %b} to {trades.Date.max():%d %b %Y}.")
     st.markdown("**Summary**")
     st.dataframe(summary, hide_index=True)
+    if st.checkbox("Compare stop-loss and volume settings (older vs newer dates)"):
+        table = morning.compare(signals, sessions, level, cost, target)
+        st.dataframe(table, hide_index=True)
+        st.download_button("Download comparison (CSV)", table.to_csv(index=False), "comparison.csv", "text/csv")
+        st.caption("40 combinations are tried, so some will look good by luck. Choose on the older dates, then check "
+                   "the newer ones. A setting that works on only one half should be rejected.")
     st.markdown("**Day by day (average of the picks)**")
     st.dataframe(daily.sort_values("Date", ascending=False), hide_index=True)
     st.markdown("**Closing position of each pick**")
@@ -144,7 +154,7 @@ def backtest_page():
         st.dataframe(trades[(trades.Date == chosen) & (trades.Side == side)].drop(columns=["Date", "Side"]),
                      hide_index=True)
     st.download_button("Download all trades (CSV)", trades.to_csv(index=False), "morning_backtest.csv", "text/csv")
-    st.caption("Limits: uses today's F&O list, has no stop-loss, assumes a fill at the candle close, and measures "
+    st.caption("Limits: uses today's F&O list, checks stops on 15m candles, assumes a fill at the candle close, and measures "
                "stock prices, not option premiums. Trades on the same day move together. Not investment advice.")
     if failed:
         with st.expander(f"Skipped: {len(failed)}"):
