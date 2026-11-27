@@ -765,12 +765,13 @@ def _oos_trades(progress=lambda m: None):
                 hit = np.where(R[di - np.where(te)[0][0]] >= SIG_MIN)[0]
                 if len(hit):
                     j = hit[0]
-                    rec.append((sy, d, Y, float(np.sign(P[di - np.where(te)[0][0], j]) * Y3[di, j])))
+                    sg_ = float(np.sign(P[di - np.where(te)[0][0], j]))
+                    rec.append((sy, d, Y, sg_ * float(Y3[di, j]), 12 + int(j), sg_))
             del A, Xt
         del C, X3, Y3
         if n_ % 20 == 0:
             gc.collect()
-    a = pd.DataFrame(rec, columns=["sym", "day", "yr", "bp"])
+    a = pd.DataFrame(rec, columns=["sym", "day", "yr", "bp", "k", "sg"])
     a["net"] = a.bp - PS_COST
     return a
 
@@ -814,6 +815,68 @@ def top20_build():
         ls["note"] = "top-20 list rebuilt"
     finally:
         ls["busy"] = ""
+        gc.collect()
+
+
+def align_job():
+    """Market alignment: take a stock BUY only when NIFTY is up on the day at the signal bar (vs yesterday's close),
+    a SELL only when NIFTY is down. Same walk-forward trades as the best-stock test, at the live signal threshold."""
+    h = hist_state()
+    h.update(an_running=True, analysis="Market-alignment test: starting...")
+    try:
+        if CID and TOKEN:
+            nifty_download(h)
+        with LOCK:
+            c = db()
+            rows = c.execute("SELECT day, b FROM idxd WHERE sym='NIFTY' ORDER BY day").fetchall()
+            c.close()
+        if len(rows) < 250:
+            h["analysis"] = "Market-alignment test: NIFTY history missing (run it when the Dhan token is valid)"
+            return
+        N = pd.DataFrame([np.frombuffer(r[1], np.float32) for r in rows], index=[r[0] for r in rows], dtype=float).ffill(axis=1).bfill(axis=1)
+        prev = N[74].shift(1)
+        a = _oos_trades(lambda m: h.update(analysis=m.replace("Best-stock test", "Market-alignment test")))
+        a = a[a.day.isin(N.index)].copy()
+        nk = N.to_numpy()[N.index.get_indexer(a.day), a.k.to_numpy()]
+        a["mkt"] = np.sign(nk / prev.reindex(a.day).to_numpy() - 1)                 # NIFTY vs yesterday's close
+        a["mkt_o"] = np.sign(nk / N[0].reindex(a.day).to_numpy() - 1)               # NIFTY vs today's first bar
+        a = a[np.isfinite(a.mkt) & (a.mkt != 0)]
+        al, ag = a[a.mkt == a.sg], a[a.mkt != a.sg]
+        tt = lambda x: x.mean() / (x.std() / np.sqrt(len(x))) if len(x) > 2 and x.std() > 0 else 0.0
+
+        def line(nm, x):
+            return (f"  {nm}: {len(x):,} trades, {(x.bp > 0).mean() * 100:.1f}% right, {x.net.mean():+.1f} bp after cost, "
+                    f"t-stat {tt(x.net):+.2f}") if len(x) > 2 else f"  {nm}: {len(x)} trades"
+        yrs = sorted(a.yr.unique())
+        if len(al) < 30 or len(ag) < 30:
+            h["analysis"] = f"Market-alignment test: too few trades to compare (aligned {len(al)}, against {len(ag)})"
+            return
+        dt_ = (al.net.mean() - ag.net.mean()) / np.sqrt(al.net.var() / len(al) + ag.net.var() / len(ag))
+        yr_ok = all(al[al.yr == y].net.mean() > 0 and al[al.yr == y].net.mean() > ag[ag.yr == y].net.mean() for y in yrs)
+        ok = al.net.mean() > 0 and dt_ > 2.5 and yr_ok
+        al_o, ag_o = a[a.mkt_o == a.sg], a[a.mkt_o != a.sg]
+        out = ["MARKET ALIGNMENT (intraday price model, F&O stocks)",
+               f"  Walk-forward trades at the live {SIG_MIN:g}x threshold, {a.day.min()} to {a.day.max()}. Costs {PS_COST:g} bp.",
+               "  Aligned = BUY while NIFTY is above yesterday's close at the signal, or SELL while it is below.",
+               "",
+               line("ALL trades", a), line("ALIGNED with NIFTY", al), line("AGAINST NIFTY", ag),
+               f"  difference aligned - against: {al.net.mean() - ag.net.mean():+.1f} bp, t-stat {dt_:+.2f}",
+               "",
+               "  By year (aligned vs against, bp after cost): " + "   ".join(
+                   f"{y}: {al[al.yr == y].net.mean():+.1f} (n={int((al.yr == y).sum())}) vs {ag[ag.yr == y].net.mean():+.1f}" for y in yrs),
+               line("aligned BUY", al[al.sg > 0]), line("aligned SELL", al[al.sg < 0]),
+               f"  Second definition (NIFTY vs today's open): aligned {al_o.net.mean():+.1f} bp ({(al_o.bp > 0).mean() * 100:.1f}% right, "
+               f"n={len(al_o):,}) vs against {ag_o.net.mean():+.1f} bp",
+               "",
+               "  PASS RULE (set in advance): aligned trades above cost, better than against-trades with t-stat above 2.5, "
+               "and positive and better in every year.",
+               "  Verdict: " + ("PASSES - worth adding as a live tag." if ok else "DOES NOT PASS."),
+               "  Research only, not advice."]
+        h["analysis"] = "\n".join(out)
+    except Exception as e:
+        h["analysis"] = f"Market-alignment test failed: {e}"
+    finally:
+        h["an_running"] = False
         gc.collect()
 
 
@@ -1940,6 +2003,9 @@ def settings_tab():
         if st.button("Run 'best stocks stay best?' test (intraday model)", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
             threading.Thread(target=persist_job, daemon=True).start()
+        if st.button("Run market-alignment test (intraday model vs NIFTY direction)", use_container_width=True, disabled=_hs["an_running"]):
+            _hs["an_running"] = True
+            threading.Thread(target=align_job, daemon=True).start()
         b1, b2 = st.columns(2)
         if b1.button("Run big-move continuation (swing)", use_container_width=True, disabled=_hs["an_running"]):
             _hs["an_running"] = True
