@@ -1,6 +1,7 @@
 """Backtest: pick the top scores at a fixed time each day and hold to that day's last continuous candle."""
 import time
 
+import numpy as np
 import pandas as pd
 
 import analysis as an
@@ -29,21 +30,17 @@ def day_signals(df, entry="10:15"):
     out = pd.DataFrame({"Date": key.date, "Score": rows.score.round().astype(int).values,
                         "Rel volume": relative.reindex(key).fillna(0).round(2).values,
                         "Entry": rows.close.values, "Close": exits.reindex(key).values})
-    # (open, high, low) of every candle after entry, needed to test stops and targets
-    after = {t: [] for t in key}
-    for t, g in d.groupby(day):
-        if t in after:
-            rest = g[g.index > rows.index[key.get_loc(t)]]
-            after[t] = list(zip(rest.open, rest.high, rest.low))
-    out["Path"] = [after[t] for t in key]
-    # for breakout entries: previous day levels, and candles from the signal candle onward
+    # previous day levels and the candles from the signal candle onward, kept compact (float32) so that
+    # six months of 200+ stocks fit in memory. Columns: minute of day, open, high, low, close.
     out["PDH"], out["PDL"] = rows.pdh.values, rows.pdl.values
-    bars = {t: [] for t in key}
+    bars = {}
     for t, g in d.groupby(day):
-        if t in bars:
+        if t in key:
             rest = g[g.index >= rows.index[key.get_loc(t)]]
-            bars[t] = list(zip(rest.index.strftime("%H:%M"), rest.open, rest.high, rest.low, rest.close))
+            bars[t] = np.column_stack([rest.index.hour * 60 + rest.index.minute, rest.open, rest.high,
+                                       rest.low, rest.close]).astype(np.float32)
     out["Bars"] = [bars[t] for t in key]
+    out["Path"] = [bars[t][1:, 1:4] for t in key]          # (open, high, low) after the signal candle
     out = out.dropna(subset=["Close"])
     out["Move %"] = (out.Close / out.Entry - 1) * 100
     return out
@@ -199,15 +196,17 @@ def nifty_state(df):
     return {(t.date(), t.strftime("%H:%M")): int(u) - int(w) for t, u, w in zip(d.index, up, down)}
 
 
-def breakout_entry(bars, sign, pdh, pdl, date, nifty=None, last_start="13:45"):
+def breakout_entry(bars, sign, pdh, pdl, date, nifty=None, last_start=13 * 60 + 45):
     """First candle that closes beyond PDH (long) or PDL (short), with NIFTY agreeing if given.
-    Returns (candle start, entry price, later (open, high, low) candles) or None."""
-    for i, (start, _, _, _, close) in enumerate(bars):
-        if start > last_start:
+    bars: rows of (minute of day, open, high, low, close). Returns (candle start "HH:MM", entry price,
+    later (open, high, low) candles) or None."""
+    for i, (minute, _, _, _, close) in enumerate(bars):
+        if minute > last_start:
             break
         broke = close > pdh if sign > 0 else close < pdl
+        start = f"{int(minute) // 60:02d}:{int(minute) % 60:02d}"
         if broke and (nifty is None or nifty.get((date, start)) == sign):
-            return start, close, [(o, h, l) for _, o, h, l, _ in bars[i + 1:]]
+            return start, float(close), bars[i + 1:, 1:4]
     return None
 
 

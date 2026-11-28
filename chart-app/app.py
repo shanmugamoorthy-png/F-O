@@ -100,21 +100,24 @@ def scanner_page():
             st.write("\n".join(f"- {f}" for f in failed))
 
 
+HISTORY_DAYS = 180   # calendar days, about 120 sessions
+
+
 def backtest_page():
     st.subheader("Backtest: top 10 at a set time, held to the close")
     entry = st.selectbox("Pick time (15m candle closed)", ["09:30", "09:45", "10:15", "11:15", "12:15"], index=2)
     stocks = {k.split("| ", 1)[1]: v for k, v in instruments().items() if k.startswith("STOCK")}
-    st.caption(f"Loads about 90 days for {len(stocks)} stocks. Takes several minutes. Don't change settings while it runs.")
+    st.caption(f"Loads about 6 months for {len(stocks)} stocks. Takes 10 to 15 minutes. Don't change settings or close the page while it runs.")
     if st.button("Run backtest", type="primary"):
         def fetch(symbol):
-            return an.resample(dhan.intraday(stocks[symbol], 5, 90, client_id, token), 15)
+            return an.resample(dhan.intraday(stocks[symbol], 5, HISTORY_DAYS, client_id, token), 15)
 
         bar = st.progress(0.0, text="Loading…")
         try:
             signals, failed = morning.collect(list(stocks), fetch, entry,
                                               lambda i, n: bar.progress(i / n, text=f"Loading {i} of {n}"))
             index = next(v for k, v in instruments().items() if k == "INDEX | NIFTY")
-            nifty = morning.nifty_state(an.resample(dhan.intraday(index, 5, 90, client_id, token), 15))
+            nifty = morning.nifty_state(an.resample(dhan.intraday(index, 5, HISTORY_DAYS, client_id, token), 15))
             st.session_state.morning = (entry, signals, failed, nifty)
         except Exception as e:
             st.error(str(e))
@@ -126,7 +129,7 @@ def backtest_page():
         st.warning("No data returned.")
         return
     # These filters reuse the loaded data, so changing them is instant
-    sessions = st.slider("Sessions to test", 10, 50, 50, 5)
+    sessions = st.slider("Sessions to test", 10, 120, 120, 10)
     level = st.slider("Minimum score", 10, 85, 30, 5)
     cost = st.number_input("Round-trip cost and slippage (%)", 0.0, 1.0, 0.10, 0.05)
     stop = st.selectbox("Stop-loss (% move in the stock, 0 = none)", list(morning.STOPS))

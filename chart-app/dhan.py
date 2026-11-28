@@ -80,15 +80,21 @@ def to_frame(data):
 
 
 def intraday(inst, interval, days, client_id, token):
-    """interval: 1, 5, 15, 25 or 60 (Dhan native). Up to 90 days per request."""
+    """interval: 1, 5, 15, 25 or 60 (Dhan native). Dhan serves at most 90 days per request, so longer
+    histories are fetched in 80-day windows, newest first, and joined."""
     now = datetime.now(IST)
-    body = dict(securityId=inst["id"], exchangeSegment=inst["segment"], instrument=inst["instrument"],
-                interval=str(interval), oi=False,
-                fromDate=(now - timedelta(days=min(days, 90))).strftime("%Y-%m-%d 09:15:00"),
-                toDate=now.strftime("%Y-%m-%d %H:%M:%S"))
-    df = to_frame(_post("/charts/intraday", body, client_id, token))
+    frames, end = [], now
+    while (now - end).days < days:
+        start = max(end - timedelta(days=80), now - timedelta(days=days))
+        body = dict(securityId=inst["id"], exchangeSegment=inst["segment"], instrument=inst["instrument"],
+                    interval=str(interval), oi=False,
+                    fromDate=start.strftime("%Y-%m-%d 09:15:00"), toDate=end.strftime("%Y-%m-%d %H:%M:%S"))
+        frames.append(to_frame(_post("/charts/intraday", body, client_id, token)))
+        end = start
+    df = pd.concat(frames) if frames else pd.DataFrame()
     if df.empty:
         return df
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return trim_session(df, inst["segment"])
 
 
