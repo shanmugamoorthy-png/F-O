@@ -341,4 +341,5 @@ def view():
 
 
 view()
-st.caption("Rule-based estimate for study only. It is not a forecast guarantee or investment advice.")
+st.caption("Describes current price action for study only. Backtests found no profitable rule after costs "
+           "(see README). Not a forecast or investment advice.")
