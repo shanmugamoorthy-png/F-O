@@ -9,6 +9,7 @@ from plotly.subplots import make_subplots
 import analysis as an
 import dhan
 import morning
+import orb
 import scanner
 
 st.set_page_config(page_title="F&O Price Action", layout="wide")
@@ -183,7 +184,48 @@ def backtest_page():
             st.write("\n".join(f"- {f}" for f in failed))
 
 
-page = st.sidebar.radio("Page", ["Chart", "Top 10 scanner", "10:15 backtest"])
+def orb_page():
+    st.subheader("Opening range breakout backtest")
+    stocks = {k.split("| ", 1)[1]: v for k, v in instruments().items() if k.startswith("STOCK")}
+    st.caption(f"{len(stocks)} stocks, about 6 months. Takes 10 to 15 minutes. Rules are fixed: the first 15 or 30 "
+               f"minute range, entry at the first 15m close beyond it (up to 14:00), one trade per stock per day, "
+               f"ranges under {orb.MIN_RANGE}% or over {orb.MAX_RANGE}% skipped. Stop = the opposite side of the range.")
+    if st.button("Run ORB test", type="primary"):
+        def fetch(symbol):
+            return an.resample(dhan.intraday(stocks[symbol], 5, HISTORY_DAYS, client_id, token), 15)
+
+        bar = st.progress(0.0, text="Loading…")
+        try:
+            index = instruments()["INDEX | NIFTY"]
+            nifty = morning.nifty_state(an.resample(dhan.intraday(index, 5, HISTORY_DAYS, client_id, token), 15))
+            trades, failed = orb.collect(list(stocks), fetch, nifty,
+                                         lambda i, n: bar.progress(i / n, text=f"Loading {i} of {n}"))
+            st.session_state.orb = (trades, failed)
+        except Exception as e:
+            st.error(str(e))
+        bar.empty()
+    if "orb" not in st.session_state:
+        return
+    trades, failed = st.session_state.orb
+    if trades.empty:
+        st.warning("No trades.")
+        return
+    cost = st.number_input("Round-trip cost and slippage (%)", 0.0, 1.0, 0.10, 0.05)
+    table = orb.summarize(trades, cost)
+    st.dataframe(table, hide_index=True)
+    st.download_button("Download ORB results (CSV)", table.to_csv(index=False), "orb_results.csv", "text/csv")
+    st.caption("'Passes all checks' needs profit in both halves of the dates, profit at 0.25% cost, a daily t-stat "
+               "of 2 or more and 100+ trades in each half. 48 settings are tried, so a pass can still be luck. "
+               "If one 15m candle touches both stop and target, the stop counts.")
+    if failed:
+        with st.expander(f"Skipped: {len(failed)}"):
+            st.write("\n".join(f"- {f}" for f in failed))
+
+
+page = st.sidebar.radio("Page", ["Chart", "Top 10 scanner", "10:15 backtest", "Opening range test"])
+if page == "Opening range test":
+    orb_page()
+    st.stop()
 if page == "10:15 backtest":
     backtest_page()
     st.stop()
